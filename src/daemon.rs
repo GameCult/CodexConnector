@@ -61,6 +61,31 @@ pub struct CodexDaemonConfig {
 }
 
 impl CodexDaemonConfig {
+    pub fn single_caller(
+        bind: impl Into<String>,
+        codex_executable: PathBuf,
+        codex_executable_sha256: [u8; 32],
+        codex_home: PathBuf,
+        replay_store: PathBuf,
+        caller: CodexCallerConfig,
+    ) -> Self {
+        Self {
+            epoch: CONFIG_EPOCH,
+            bind: bind.into(),
+            codex_executable,
+            codex_executable_sha256,
+            codex_home,
+            max_frame_bytes: caller
+                .max_payload_bytes
+                .saturating_add(FRAME_OVERHEAD_BUDGET),
+            max_connections: caller.max_concurrent_requests.max(8),
+            socket_timeout_ms: 10_000,
+            max_expiry_skew_ms: 300_000,
+            callers: vec![caller],
+            replay_store,
+        }
+    }
+
     pub fn validate(&self) -> Result<SocketAddr, CodexDaemonError> {
         if self.epoch != CONFIG_EPOCH {
             return Err(CodexDaemonError::InvalidConfig("epoch"));
@@ -385,6 +410,34 @@ mod tests {
             Err(CodexDaemonError::InvalidConfig("epoch"))
         ));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn single_caller_initializer_derives_daemon_bounds_without_reowning_policy() {
+        let root = Path::new("/srv/codex-connector");
+        let caller = CodexCallerConfig {
+            caller_runtime_id: "ghostlight-dungeon-yggdrasil".to_string(),
+            connection_key_file: root.join("ghostlight.key"),
+            connection_key_epoch: 3,
+            allowed_models: vec!["gpt-5.4".to_string()],
+            max_concurrent_requests: 12,
+            max_payload_bytes: 1_048_576,
+            max_output_tokens: 32_768,
+        };
+        let config = CodexDaemonConfig::single_caller(
+            "127.0.0.1:4103",
+            root.join("codex"),
+            [7; 32],
+            root.join("codex-home"),
+            root.join("replay.cc"),
+            caller.clone(),
+        );
+
+        assert_eq!(config.epoch, CONFIG_EPOCH);
+        assert_eq!(config.max_frame_bytes, 1_052_672);
+        assert_eq!(config.max_connections, 12);
+        assert_eq!(config.callers, vec![caller]);
+        config.validate().unwrap();
     }
 
     #[test]

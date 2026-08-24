@@ -53,10 +53,11 @@ cargo test --lib --features daemon
 cargo check --bin codex-connector --features daemon
 ```
 
-This is not yet a deployable replacement for the live connector. Redacted
-CultMesh/Odin publication, shared consumer client cuts, and the independent
-Idunn target remain open. The old daemon remains the sole live credential
-writer until those proofs land.
+The same production binary can initialize a typed single-caller `.cc`
+configuration for first deployment, then serve only from that admitted state.
+Redacted CultMesh/Odin publication and the independent Idunn target remain
+open. The old daemon remains the sole live credential writer until that
+deployment transaction lands.
 
 ## Contract invariant
 
