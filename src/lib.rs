@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use cultcache_rs::{CultCache, DatabaseEntry, OwnedRedbMessagePackBackingStore};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -437,6 +439,7 @@ pub enum CodexRefusal {
     Policy,
     Capacity,
     InFlight,
+    Indeterminate,
     ReplayConflict,
     Malformed,
 }
@@ -761,6 +764,7 @@ fn validate_envelope(
 
 pub struct CodexCallerAdmission {
     caller_runtime_id: String,
+    connection_key_epoch: u32,
     security: CodexTransportKey,
     allowed_models: HashSet<String>,
     max_concurrent_requests: usize,
@@ -772,6 +776,7 @@ impl CodexCallerAdmission {
     pub fn new(
         caller_runtime_id: impl Into<String>,
         connection_key: impl Into<String>,
+        connection_key_epoch: u32,
         allowed_models: impl IntoIterator<Item = String>,
         max_concurrent_requests: usize,
         max_payload_bytes: usize,
@@ -780,7 +785,8 @@ impl CodexCallerAdmission {
         let caller_runtime_id = caller_runtime_id.into();
         require_id(&caller_runtime_id, "caller_runtime_id")?;
         let allowed_models = allowed_models.into_iter().collect::<HashSet<_>>();
-        if allowed_models.is_empty()
+        if connection_key_epoch == 0
+            || allowed_models.is_empty()
             || allowed_models
                 .iter()
                 .any(|model| require_id(model, "allowed_model").is_err())
@@ -794,6 +800,7 @@ impl CodexCallerAdmission {
         let security = CodexTransportKey::from_connection_secret(connection_key.as_str())?;
         Ok(Self {
             caller_runtime_id,
+            connection_key_epoch,
             security,
             allowed_models,
             max_concurrent_requests,
@@ -813,17 +820,27 @@ struct RequestIdentity {
     request_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ActiveRequest {
-    invocation_sha256: [u8; 32],
-    expires_at_unix_ms: u64,
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum CodexReplayState {
+    Active,
+    Completed { response: CodexTransportEnvelope },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CompletedRequest {
+#[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
+#[cultcache(type = "gamecult.codex.replay_record.v1")]
+struct CodexReplayRecord {
+    #[cultcache(key = 0)]
+    caller_runtime_id: String,
+    #[cultcache(key = 1)]
+    request_id: String,
+    #[cultcache(key = 2)]
+    connection_key_epoch: u32,
+    #[cultcache(key = 3)]
     invocation_sha256: [u8; 32],
+    #[cultcache(key = 4)]
     expires_at_unix_ms: u64,
-    response: CodexTransportEnvelope,
+    #[cultcache(key = 5)]
+    state: CodexReplayState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -846,13 +863,14 @@ pub enum CodexTransportAdmission {
 
 pub struct CodexTransportService {
     callers: HashMap<String, CodexCallerAdmission>,
-    active: HashMap<RequestIdentity, ActiveRequest>,
-    completed: HashMap<RequestIdentity, CompletedRequest>,
+    live: HashSet<RequestIdentity>,
+    replay_store: CultCache,
     max_expiry_skew_ms: u64,
 }
 
 impl CodexTransportService {
-    pub fn new(
+    pub fn open(
+        replay_store_path: &Path,
         admissions: impl IntoIterator<Item = CodexCallerAdmission>,
         max_expiry_skew_ms: u64,
     ) -> Result<Self, ServiceError> {
@@ -873,10 +891,43 @@ impl CodexTransportService {
         if callers.is_empty() {
             return Err(ServiceError::InvalidAdmission);
         }
+
+        let mut replay_store = CultCache::new();
+        replay_store
+            .register_entry_type::<CodexReplayRecord>()
+            .map_err(replay_store_error)?;
+        replay_store.add_generic_backing_store(
+            OwnedRedbMessagePackBackingStore::new(replay_store_path).map_err(replay_store_error)?,
+        );
+        replay_store
+            .pull_all_backing_stores()
+            .map_err(replay_store_error)?;
+
+        for (key, record) in replay_store
+            .get_all_with_keys::<CodexReplayRecord>()
+            .map_err(replay_store_error)?
+        {
+            let identity = RequestIdentity {
+                caller_runtime_id: record.caller_runtime_id.clone(),
+                request_id: record.request_id.clone(),
+            };
+            if key != replay_key(&identity)
+                || record.invocation_sha256 == [0; 32]
+                || record.expires_at_unix_ms == 0
+            {
+                return Err(ServiceError::InvalidReplayRecord);
+            }
+            let Some(caller) = callers.get(&record.caller_runtime_id) else {
+                continue;
+            };
+            if record.connection_key_epoch != caller.connection_key_epoch {
+                return Err(ServiceError::ReplayCallerKeyMismatch);
+            }
+        }
         Ok(Self {
             callers,
-            active: HashMap::new(),
-            completed: HashMap::new(),
+            live: HashSet::new(),
+            replay_store,
             max_expiry_skew_ms,
         })
     }
@@ -909,48 +960,55 @@ impl CodexTransportService {
             return self.reply_refusal(&invocation, CodexRefusal::Policy, &security);
         }
 
-        self.active
-            .retain(|_, request| request.expires_at_unix_ms >= now_unix_ms);
-        self.completed
-            .retain(|_, request| request.expires_at_unix_ms >= now_unix_ms);
-
         let identity = RequestIdentity {
             caller_runtime_id: invocation.caller_runtime_id.clone(),
             request_id: invocation.request_id().to_string(),
         };
         let invocation_sha256: [u8; 32] =
             Sha256::digest(canonical_invocation_bytes(&invocation)?).into();
-        if let Some(completed) = self.completed.get(&identity) {
-            return if completed.invocation_sha256 == invocation_sha256 {
-                Ok(CodexTransportAdmission::Reply(completed.response.clone()))
-            } else {
-                self.reply_refusal(&invocation, CodexRefusal::ReplayConflict, &security)
+        if let Some(record) = self
+            .replay_store
+            .get::<CodexReplayRecord>(&replay_key(&identity))
+            .map_err(replay_store_error)?
+        {
+            if record.invocation_sha256 != invocation_sha256 {
+                return self.reply_refusal(&invocation, CodexRefusal::ReplayConflict, &security);
+            }
+            return match record.state {
+                CodexReplayState::Completed { response } => {
+                    Ok(CodexTransportAdmission::Reply(response))
+                }
+                CodexReplayState::Active => {
+                    let refusal = if self.live.contains(&identity) {
+                        CodexRefusal::InFlight
+                    } else {
+                        CodexRefusal::Indeterminate
+                    };
+                    self.reply_refusal(&invocation, refusal, &security)
+                }
             };
-        }
-        if let Some(active) = self.active.get(&identity) {
-            let refusal = if active.invocation_sha256 == invocation_sha256 {
-                CodexRefusal::InFlight
-            } else {
-                CodexRefusal::ReplayConflict
-            };
-            return self.reply_refusal(&invocation, refusal, &security);
         }
         let active_for_caller = self
-            .active
-            .keys()
+            .live
+            .iter()
             .filter(|key| key.caller_runtime_id == invocation.caller_runtime_id)
             .count();
         if active_for_caller >= max_concurrent_requests {
             return self.reply_refusal(&invocation, CodexRefusal::Capacity, &security);
         }
 
-        self.active.insert(
-            identity,
-            ActiveRequest {
-                invocation_sha256,
-                expires_at_unix_ms: invocation.expires_at_unix_ms,
-            },
-        );
+        let replay_record = CodexReplayRecord {
+            caller_runtime_id: identity.caller_runtime_id.clone(),
+            request_id: identity.request_id.clone(),
+            connection_key_epoch: caller.connection_key_epoch,
+            invocation_sha256,
+            expires_at_unix_ms: invocation.expires_at_unix_ms,
+            state: CodexReplayState::Active,
+        };
+        self.replay_store
+            .put(replay_key(&identity), &replay_record)
+            .map_err(replay_store_error)?;
+        self.live.insert(identity);
         Ok(CodexTransportAdmission::Execute(Box::new(
             CodexExecutionClaim {
                 invocation,
@@ -975,11 +1033,17 @@ impl CodexTransportService {
             caller_runtime_id: claim.invocation.caller_runtime_id.clone(),
             request_id: claim.invocation.request_id().to_string(),
         };
+        if !self.live.contains(&identity) {
+            return Err(ServiceError::NoActiveRequest);
+        }
         let active = self
-            .active
-            .get(&identity)
+            .replay_store
+            .get::<CodexReplayRecord>(&replay_key(&identity))
+            .map_err(replay_store_error)?
             .ok_or(ServiceError::NoActiveRequest)?;
-        if active.invocation_sha256 != claim.invocation_sha256 {
+        if active.invocation_sha256 != claim.invocation_sha256
+            || !matches!(active.state, CodexReplayState::Active)
+        {
             return Err(ServiceError::ActiveRequestMismatch);
         }
         let caller = self
@@ -987,27 +1051,21 @@ impl CodexTransportService {
             .get(&identity.caller_runtime_id)
             .ok_or(ServiceError::CallerNotAdmitted)?;
         let response = encrypt_result(&result, &caller.security)?;
-        self.active.remove(&identity);
-        self.completed.insert(
-            identity,
-            CompletedRequest {
-                invocation_sha256: claim.invocation_sha256,
-                expires_at_unix_ms: claim.invocation.expires_at_unix_ms,
+        let replay_record = CodexReplayRecord {
+            caller_runtime_id: identity.caller_runtime_id.clone(),
+            request_id: identity.request_id.clone(),
+            connection_key_epoch: caller.connection_key_epoch,
+            invocation_sha256: claim.invocation_sha256,
+            expires_at_unix_ms: claim.invocation.expires_at_unix_ms,
+            state: CodexReplayState::Completed {
                 response: response.clone(),
             },
-        );
-        Ok(response)
-    }
-
-    pub fn cancel(&mut self, claim: &CodexExecutionClaim) -> bool {
-        let identity = RequestIdentity {
-            caller_runtime_id: claim.invocation.caller_runtime_id.clone(),
-            request_id: claim.invocation.request_id().to_string(),
         };
-        self.active
-            .get(&identity)
-            .is_some_and(|active| active.invocation_sha256 == claim.invocation_sha256)
-            && self.active.remove(&identity).is_some()
+        self.replay_store
+            .put(replay_key(&identity), &replay_record)
+            .map_err(replay_store_error)?;
+        self.live.remove(&identity);
+        Ok(response)
     }
 
     fn reply_refusal(
@@ -1021,6 +1079,26 @@ impl CodexTransportService {
             security,
         )?))
     }
+}
+
+fn replay_key(identity: &RequestIdentity) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((identity.caller_runtime_id.len() as u64).to_be_bytes());
+    hasher.update(identity.caller_runtime_id.as_bytes());
+    hasher.update((identity.request_id.len() as u64).to_be_bytes());
+    hasher.update(identity.request_id.as_bytes());
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = hasher.finalize();
+    let mut key = String::with_capacity(64);
+    for byte in digest {
+        key.push(HEX[(byte >> 4) as usize] as char);
+        key.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    key
+}
+
+fn replay_store_error(error: impl std::fmt::Display) -> ServiceError {
+    ServiceError::ReplayStore(error.to_string())
 }
 
 fn contract_refusal(error: &ContractError) -> CodexRefusal {
@@ -1042,6 +1120,12 @@ pub enum ServiceError {
     DuplicateCaller,
     #[error("callers must not share transport keys")]
     SharedCallerKey,
+    #[error("connector replay store failed: {0}")]
+    ReplayStore(String),
+    #[error("connector replay record is malformed")]
+    InvalidReplayRecord,
+    #[error("caller key changed while durable replay records still exist")]
+    ReplayCallerKeyMismatch,
     #[error("caller runtime is not admitted")]
     CallerNotAdmitted,
     #[error("transport payload exceeds the caller bound")]
@@ -1130,6 +1214,33 @@ pub enum ContractError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_STORE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+    struct TestStore {
+        root: std::path::PathBuf,
+        path: std::path::PathBuf,
+    }
+
+    impl TestStore {
+        fn new() -> Self {
+            let sequence = TEST_STORE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "codex-connector-replay-{}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("replay.cc");
+            Self { root, path }
+        }
+    }
+
+    impl Drop for TestStore {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
 
     fn request() -> CodexProviderRequest {
         let mut request = CodexProviderRequest::new(
@@ -1330,6 +1441,7 @@ mod tests {
         CodexCallerAdmission::new(
             caller_runtime_id,
             key,
+            1,
             ["gpt-5.4".to_string()],
             max_concurrent_requests,
             64 * 1024,
@@ -1338,8 +1450,9 @@ mod tests {
         .unwrap()
     }
 
-    fn service(max_concurrent_requests: usize) -> CodexTransportService {
-        CodexTransportService::new(
+    fn open_service(store: &TestStore, max_concurrent_requests: usize) -> CodexTransportService {
+        CodexTransportService::open(
+            &store.path,
             [
                 caller(
                     "epiphany-yggdrasil",
@@ -1397,8 +1510,10 @@ mod tests {
 
     #[test]
     fn service_refuses_shared_keys_and_isolates_caller_request_identities() {
+        let store = TestStore::new();
         assert!(matches!(
-            CodexTransportService::new(
+            CodexTransportService::open(
+                &store.path,
                 [
                     caller("epiphany-yggdrasil", "shared-key", 1),
                     caller("ghostlight-yggdrasil", "shared-key", 1),
@@ -1410,7 +1525,7 @@ mod tests {
 
         let epiphany = invocation_for("epiphany-yggdrasil", "shared-request-id");
         let ghostlight = invocation_for("ghostlight-yggdrasil", "shared-request-id");
-        let mut service = service(1);
+        let mut service = open_service(&store, 1);
         assert!(matches!(
             service
                 .begin(
@@ -1435,9 +1550,10 @@ mod tests {
 
     #[test]
     fn service_returns_exact_completed_replay_and_refuses_conflicting_replay() {
+        let store = TestStore::new();
         let invocation = invocation();
         let security = security("epiphany-distinct-test-key");
-        let mut service = service(1);
+        let mut service = open_service(&store, 1);
         let claim = match service
             .begin(&encrypt_invocation(&invocation, &security).unwrap(), 1_000)
             .unwrap()
@@ -1462,6 +1578,8 @@ mod tests {
                 ),
             )
             .unwrap();
+        drop(service);
+        let mut service = open_service(&store, 1);
 
         let replay = match service
             .begin(&encrypt_invocation(&invocation, &security).unwrap(), 1_000)
@@ -1499,10 +1617,11 @@ mod tests {
 
     #[test]
     fn service_refuses_duplicate_inflight_and_per_caller_capacity() {
+        let store = TestStore::new();
         let first = invocation_for("epiphany-yggdrasil", "request-1");
         let second = invocation_for("epiphany-yggdrasil", "request-2");
         let security = security("epiphany-distinct-test-key");
-        let mut service = service(1);
+        let mut service = open_service(&store, 1);
         let first_envelope = encrypt_invocation(&first, &security).unwrap();
         assert!(matches!(
             service.begin(&first_envelope, 1_000).unwrap(),
@@ -1527,5 +1646,60 @@ mod tests {
                 CodexTransportDisposition::Refused(expected)
             );
         }
+    }
+
+    #[test]
+    fn restart_refuses_ambiguous_claim_without_consuming_live_capacity() {
+        let store = TestStore::new();
+        let first = invocation_for("epiphany-yggdrasil", "request-1");
+        let second = invocation_for("epiphany-yggdrasil", "request-2");
+        let security = security("epiphany-distinct-test-key");
+        let mut service = open_service(&store, 1);
+        assert!(matches!(
+            service
+                .begin(&encrypt_invocation(&first, &security).unwrap(), 1_000)
+                .unwrap(),
+            CodexTransportAdmission::Execute(_)
+        ));
+        drop(service);
+
+        let mut restarted = open_service(&store, 1);
+        let ambiguous = match restarted
+            .begin(&encrypt_invocation(&first, &security).unwrap(), 1_000)
+            .unwrap()
+        {
+            CodexTransportAdmission::Reply(response) => response,
+            CodexTransportAdmission::Execute(_) => panic!("ambiguous claim re-executed"),
+        };
+        assert_eq!(
+            decrypt_result(&ambiguous, &security, &first)
+                .unwrap()
+                .disposition,
+            CodexTransportDisposition::Refused(CodexRefusal::Indeterminate)
+        );
+        assert!(matches!(
+            restarted
+                .begin(&encrypt_invocation(&second, &security).unwrap(), 1_000)
+                .unwrap(),
+            CodexTransportAdmission::Execute(_)
+        ));
+        drop(restarted);
+        assert!(matches!(
+            CodexTransportService::open(
+                &store.path,
+                [CodexCallerAdmission::new(
+                    "epiphany-yggdrasil",
+                    "rotated-connection-key",
+                    2,
+                    ["gpt-5.4".to_string()],
+                    1,
+                    64 * 1024,
+                    32_768,
+                )
+                .unwrap()],
+                5_000,
+            ),
+            Err(ServiceError::ReplayCallerKeyMismatch)
+        ));
     }
 }

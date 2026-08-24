@@ -18,7 +18,7 @@ use crate::{
     CodexTransportAdmission, CodexTransportEnvelope, CodexTransportService, ServiceError,
 };
 
-const CONFIG_EPOCH: u32 = 1;
+const CONFIG_EPOCH: u32 = 2;
 const CONFIG_KEY: &str = "runtime";
 const FRAME_OVERHEAD_BUDGET: usize = 4096;
 
@@ -26,6 +26,7 @@ const FRAME_OVERHEAD_BUDGET: usize = 4096;
 pub struct CodexCallerConfig {
     pub caller_runtime_id: String,
     pub connection_key_file: PathBuf,
+    pub connection_key_epoch: u32,
     pub allowed_models: Vec<String>,
     pub max_concurrent_requests: usize,
     pub max_payload_bytes: usize,
@@ -55,6 +56,8 @@ pub struct CodexDaemonConfig {
     pub max_expiry_skew_ms: u64,
     #[cultcache(key = 9)]
     pub callers: Vec<CodexCallerConfig>,
+    #[cultcache(key = 10)]
+    pub replay_store: PathBuf,
 }
 
 impl CodexDaemonConfig {
@@ -72,6 +75,7 @@ impl CodexDaemonConfig {
         if self.codex_executable.as_os_str().is_empty()
             || self.codex_executable_sha256 == [0; 32]
             || self.codex_home.as_os_str().is_empty()
+            || self.replay_store.as_os_str().is_empty()
             || self.max_frame_bytes < FRAME_OVERHEAD_BUDGET * 2
             || self.max_frame_bytes > u32::MAX as usize
             || self.max_connections == 0
@@ -87,6 +91,7 @@ impl CodexDaemonConfig {
                 || caller.caller_runtime_id.trim() != caller.caller_runtime_id
                 || !caller_ids.insert(caller.caller_runtime_id.as_str())
                 || caller.connection_key_file.as_os_str().is_empty()
+                || caller.connection_key_epoch == 0
                 || caller.allowed_models.is_empty()
                 || caller
                     .allowed_models
@@ -140,7 +145,8 @@ pub fn write_daemon_config(
 pub fn serve(config_path: &Path) -> Result<(), CodexDaemonError> {
     let config = load_daemon_config(config_path)?;
     let bind = config.validate()?;
-    let service = Arc::new(Mutex::new(CodexTransportService::new(
+    let service = Arc::new(Mutex::new(CodexTransportService::open(
+        &config.replay_store,
         load_admissions(&config)?,
         config.max_expiry_skew_ms,
     )?));
@@ -208,6 +214,7 @@ fn load_admissions(
             CodexCallerAdmission::new(
                 caller.caller_runtime_id.clone(),
                 secret.to_string(),
+                caller.connection_key_epoch,
                 caller.allowed_models.clone(),
                 caller.max_concurrent_requests,
                 caller.max_payload_bytes,
@@ -372,11 +379,13 @@ mod tests {
             callers: vec![CodexCallerConfig {
                 caller_runtime_id: "epiphany-yggdrasil".to_string(),
                 connection_key_file: root.join("epiphany.key"),
+                connection_key_epoch: 1,
                 allowed_models: vec!["gpt-5.4".to_string()],
                 max_concurrent_requests: 4,
                 max_payload_bytes: 512 * 1024,
                 max_output_tokens: 32_768,
             }],
+            replay_store: root.join("replay.cc"),
         }
     }
 
