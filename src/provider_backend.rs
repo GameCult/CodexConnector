@@ -21,7 +21,7 @@ use crate::CodexTransportOutcome;
 use crate::CodexTransportReceipt;
 use crate::CodexTransportResult;
 use crate::RECEIPT_SCHEMA_ID;
-use crate::canonical_responses_body_bytes;
+use crate::canonical_responses_body;
 
 const MAX_APP_SERVER_LINE_BYTES: usize = 1024 * 1024;
 const MAX_INTERLEAVED_MESSAGES: usize = 64;
@@ -111,8 +111,6 @@ impl CodexProviderBackend {
         &self,
         invocation: &CodexTransportInvocation,
     ) -> Result<CodexTransportResult, CodexProviderBackendError> {
-        let body = canonical_responses_body_bytes(&invocation.request)
-            .map_err(|_| CodexProviderBackendError::ProviderRequest)?;
         let (first, user_agent) = {
             let mut authority = self
                 .authority
@@ -121,6 +119,7 @@ impl CodexProviderBackend {
             let credential = authority.read_credential(false)?;
             (credential, authority.app_server_user_agent.clone())
         };
+        let body = provider_http_body(&invocation.request, first.mode)?;
         let first_digest = first.auth_file_sha256;
         let response = match send_provider_request(
             &self.http,
@@ -151,11 +150,12 @@ impl CodexProviderBackend {
                         "Codex credential refresh did not advance the credential store",
                     ));
                 }
+                let refreshed_body = provider_http_body(&invocation.request, refreshed.mode)?;
                 send_provider_request(
                     &self.http,
                     provider_url(refreshed.mode),
                     invocation,
-                    &body,
+                    &refreshed_body,
                     &refreshed,
                     &user_agent,
                 )
@@ -206,6 +206,24 @@ impl CodexProviderBackend {
         }
         Ok(result)
     }
+}
+
+fn provider_http_body(
+    request: &crate::CodexProviderRequest,
+    mode: CodexAuthMode,
+) -> Result<Vec<u8>, CodexProviderBackendError> {
+    let mut body = canonical_responses_body(request)
+        .map_err(|_| CodexProviderBackendError::ProviderRequest)?;
+    if mode == CodexAuthMode::Chatgpt {
+        // The ChatGPT Codex subscription boundary rejects this otherwise
+        // standard Responses parameter. The typed caller request and its
+        // receipt digest retain the requested cognitive budget; only the
+        // provider-specific HTTP lowering omits the unsupported field.
+        body.as_object_mut()
+            .expect("canonical Responses body is an object")
+            .remove("max_output_tokens");
+    }
+    serde_json::to_vec(&body).map_err(|_| CodexProviderBackendError::ProviderRequest)
 }
 
 fn provider_url(mode: CodexAuthMode) -> &'static str {
@@ -1155,7 +1173,7 @@ mod tests {
         });
         let invocation =
             CodexTransportInvocation::new("caller-http", 2_000, [9; 32], request).unwrap();
-        let expected_body = canonical_responses_body_bytes(&invocation.request).unwrap();
+        let expected_body = provider_http_body(&invocation.request, CodexAuthMode::ApiKey).unwrap();
         let credential = CodexCredentialSnapshot {
             mode: CodexAuthMode::ApiKey,
             bearer: Zeroizing::new("secret-http-token".to_string()),
@@ -1196,5 +1214,40 @@ mod tests {
         assert!(headers.contains("session_id: conversation-http"));
         assert!(headers.contains("x-client-request-id: request-http"));
         assert_eq!(&received[headers_end + 4..], expected_body);
+    }
+
+    #[test]
+    fn chatgpt_http_lowering_omits_only_its_unsupported_output_limit() {
+        let mut request = crate::CodexProviderRequest::new(
+            "request-budget",
+            "conversation-budget",
+            "gpt-test",
+            "Return a bounded result.",
+        );
+        request.input.push(crate::CodexInputItem::UserText {
+            text: "projected state".to_string(),
+        });
+        request.max_output_tokens = Some(768);
+        let request_digest = crate::provider_request_sha256(&request).unwrap();
+
+        let api: Value =
+            serde_json::from_slice(&provider_http_body(&request, CodexAuthMode::ApiKey).unwrap())
+                .unwrap();
+        let chatgpt: Value =
+            serde_json::from_slice(&provider_http_body(&request, CodexAuthMode::Chatgpt).unwrap())
+                .unwrap();
+
+        assert_eq!(api["max_output_tokens"], 768);
+        assert!(chatgpt.get("max_output_tokens").is_none());
+        let mut expected_chatgpt = api;
+        expected_chatgpt
+            .as_object_mut()
+            .unwrap()
+            .remove("max_output_tokens");
+        assert_eq!(chatgpt, expected_chatgpt);
+        assert_eq!(
+            crate::provider_request_sha256(&request).unwrap(),
+            request_digest
+        );
     }
 }
