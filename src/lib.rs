@@ -36,9 +36,11 @@ pub struct CodexProviderRequest {
     pub reasoning_effort: Option<String>,
     pub reasoning_summary: Option<String>,
     pub service_tier: Option<String>,
-    pub output_contract_id: Option<String>,
+    pub output_format_name: Option<String>,
     pub previous_response_id: Option<String>,
     pub tools: Vec<CodexToolDefinition>,
+    pub tool_choice: CodexToolChoice,
+    pub parallel_tool_calls: bool,
     pub output_schema_json: Option<String>,
     pub max_output_tokens: Option<u32>,
     pub prompt_cache_key: Option<String>,
@@ -61,9 +63,11 @@ impl CodexProviderRequest {
             reasoning_effort: None,
             reasoning_summary: None,
             service_tier: None,
-            output_contract_id: None,
+            output_format_name: None,
             previous_response_id: None,
             tools: Vec::new(),
+            tool_choice: CodexToolChoice::Auto,
+            parallel_tool_calls: false,
             output_schema_json: None,
             max_output_tokens: None,
             prompt_cache_key: None,
@@ -92,7 +96,7 @@ impl CodexProviderRequest {
             (self.reasoning_effort.as_deref(), "reasoning_effort"),
             (self.reasoning_summary.as_deref(), "reasoning_summary"),
             (self.service_tier.as_deref(), "service_tier"),
-            (self.output_contract_id.as_deref(), "output_contract_id"),
+            (self.output_format_name.as_deref(), "output_format_name"),
             (self.previous_response_id.as_deref(), "previous_response_id"),
         ] {
             if let Some(value) = value {
@@ -101,13 +105,27 @@ impl CodexProviderRequest {
         }
         if let Some(schema) = &self.output_schema_json {
             require_content(schema, "output_schema_json")?;
+            require_json_object(schema, "output_schema_json")?;
+            require_provider_name(
+                self.output_format_name
+                    .as_deref()
+                    .ok_or(ContractError::Invalid("output_format_name"))?,
+                "output_format_name",
+            )?;
+        } else if self.output_format_name.is_some() {
+            return Err(ContractError::Invalid("output_schema_json"));
+        }
+
+        if self.tools.is_empty() && self.tool_choice == CodexToolChoice::Required {
+            return Err(ContractError::Invalid("tool_choice"));
         }
 
         let mut tool_names = HashSet::new();
         for tool in &self.tools {
-            require_id(&tool.name, "tool.name")?;
+            require_provider_name(&tool.name, "tool.name")?;
             require_content(&tool.description, "tool.description")?;
             require_content(&tool.parameters_json, "tool.parameters_json")?;
+            require_json_object(&tool.parameters_json, "tool.parameters_json")?;
             if !tool_names.insert(tool.name.as_str()) {
                 return Err(ContractError::DuplicateTool(tool.name.clone()));
             }
@@ -122,18 +140,25 @@ impl CodexProviderRequest {
                     name,
                     arguments,
                 } => {
-                    require_id(call_id, "input.call_id")?;
-                    require_id(name, "input.tool_name")?;
+                    require_provider_call_id(call_id, "input.call_id")?;
+                    require_provider_name(name, "input.tool_name")?;
                     require_content(arguments, "input.arguments")?;
                 }
                 CodexInputItem::ToolResult { call_id, output } => {
-                    require_id(call_id, "input.call_id")?;
+                    require_provider_call_id(call_id, "input.call_id")?;
                     require_content(output, "input.output")?;
                 }
             }
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexToolChoice {
+    Auto,
+    Required,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -409,6 +434,141 @@ pub fn canonical_provider_request_bytes(
 
 pub fn provider_request_sha256(request: &CodexProviderRequest) -> Result<[u8; 32], ContractError> {
     Ok(Sha256::digest(canonical_provider_request_bytes(request)?).into())
+}
+
+pub fn canonical_responses_body(
+    request: &CodexProviderRequest,
+) -> Result<serde_json::Value, ContractError> {
+    request.validate()?;
+    let input = request
+        .input
+        .iter()
+        .map(|item| match item {
+            CodexInputItem::UserText { text } => serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            }),
+            CodexInputItem::AssistantText { text } => serde_json::json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            }),
+            CodexInputItem::ToolCall {
+                call_id,
+                name,
+                arguments,
+            } => serde_json::json!({
+                "type": "function_call",
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
+            }),
+            CodexInputItem::ToolResult { call_id, output } => serde_json::json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            }),
+        })
+        .collect::<Vec<_>>();
+    let tools = request
+        .tools
+        .iter()
+        .map(|tool| {
+            Ok(serde_json::json!({
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": serde_json::from_str::<serde_json::Value>(&tool.parameters_json)
+                    .map_err(|_| ContractError::Invalid("tool.parameters_json"))?,
+                "strict": true,
+            }))
+        })
+        .collect::<Result<Vec<_>, ContractError>>()?;
+    let mut body = serde_json::json!({
+        "model": request.model,
+        "instructions": request.instructions,
+        "input": input,
+        "tools": tools,
+        "tool_choice": match request.tool_choice {
+            CodexToolChoice::Auto => "auto",
+            CodexToolChoice::Required => "required",
+        },
+        "parallel_tool_calls": request.parallel_tool_calls,
+        "store": false,
+        "stream": true,
+        "include": [],
+    });
+    let object = body
+        .as_object_mut()
+        .expect("the statically constructed Responses body is an object");
+    if request.reasoning_effort.is_some() || request.reasoning_summary.is_some() {
+        let mut reasoning = serde_json::Map::new();
+        if let Some(effort) = &request.reasoning_effort {
+            reasoning.insert("effort".to_string(), serde_json::json!(effort));
+        }
+        if let Some(summary) = &request.reasoning_summary {
+            reasoning.insert("summary".to_string(), serde_json::json!(summary));
+        }
+        object.insert("reasoning".to_string(), reasoning.into());
+    }
+    for (name, value) in [
+        (
+            "service_tier",
+            request
+                .service_tier
+                .as_ref()
+                .map(|value| serde_json::json!(value)),
+        ),
+        (
+            "previous_response_id",
+            request
+                .previous_response_id
+                .as_ref()
+                .map(|value| serde_json::json!(value)),
+        ),
+        (
+            "prompt_cache_key",
+            request
+                .prompt_cache_key
+                .as_ref()
+                .map(|value| serde_json::json!(value)),
+        ),
+        (
+            "max_output_tokens",
+            request
+                .max_output_tokens
+                .map(|value| serde_json::json!(value)),
+        ),
+    ] {
+        if let Some(value) = value {
+            object.insert(name.to_string(), value);
+        }
+    }
+    if let (Some(name), Some(schema)) = (
+        request.output_format_name.as_ref(),
+        request.output_schema_json.as_ref(),
+    ) {
+        object.insert(
+            "text".to_string(),
+            serde_json::json!({
+                "format": {
+                    "type": "json_schema",
+                    "name": name,
+                    "strict": true,
+                    "schema": serde_json::from_str::<serde_json::Value>(schema)
+                        .map_err(|_| ContractError::Invalid("output_schema_json"))?,
+                }
+            }),
+        );
+    }
+    Ok(body)
+}
+
+pub fn canonical_responses_body_bytes(
+    request: &CodexProviderRequest,
+) -> Result<Vec<u8>, ContractError> {
+    serde_json::to_vec(&canonical_responses_body(request)?).map_err(|_| ContractError::Encoding)
 }
 
 pub fn canonical_invocation_bytes(
@@ -900,6 +1060,35 @@ fn require_content(value: &str, field: &'static str) -> Result<(), ContractError
     Ok(())
 }
 
+fn require_json_object(value: &str, field: &'static str) -> Result<(), ContractError> {
+    if !matches!(
+        serde_json::from_str::<serde_json::Value>(value),
+        Ok(serde_json::Value::Object(_))
+    ) {
+        return Err(ContractError::Invalid(field));
+    }
+    Ok(())
+}
+
+fn require_provider_name(value: &str, field: &'static str) -> Result<(), ContractError> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(ContractError::Invalid(field));
+    }
+    Ok(())
+}
+
+fn require_provider_call_id(value: &str, field: &'static str) -> Result<(), ContractError> {
+    if value.is_empty() || value.len() > 64 || !value.is_ascii() {
+        return Err(ContractError::Invalid(field));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ContractError {
     #[error("unexpected schema")]
@@ -980,6 +1169,56 @@ mod tests {
         assert_ne!(
             provider_request_sha256(&original).unwrap(),
             provider_request_sha256(&changed).unwrap()
+        );
+    }
+
+    #[test]
+    fn canonical_responses_body_preserves_caller_owned_provider_policy() {
+        let mut request = request();
+        request.tool_choice = CodexToolChoice::Required;
+        request.parallel_tool_calls = false;
+        request.reasoning_effort = Some("high".to_string());
+        request.previous_response_id = Some("response-previous".to_string());
+        request.max_output_tokens = Some(512);
+        request.output_format_name = Some("epiphany_role_result_v3".to_string());
+        request.output_schema_json = Some(
+            r#"{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}"#
+                .to_string(),
+        );
+
+        let body = canonical_responses_body(&request).unwrap();
+        assert_eq!(body["tool_choice"], "required");
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["reasoning"], serde_json::json!({"effort": "high"}));
+        assert_eq!(body["previous_response_id"], "response-previous");
+        assert_eq!(body["max_output_tokens"], 512);
+        assert_eq!(body["tools"][0]["name"], "read_source");
+        assert_eq!(body["text"]["format"]["name"], "epiphany_role_result_v3");
+        assert_eq!(
+            canonical_responses_body_bytes(&request).unwrap(),
+            serde_json::to_vec(&body).unwrap()
+        );
+    }
+
+    #[test]
+    fn provider_contract_refuses_transport_side_fixup_pressure() {
+        let mut request = request();
+        request.output_format_name = Some("epiphany.role.result".to_string());
+        request.output_schema_json = Some(r#"{"type":"object"}"#.to_string());
+        assert_eq!(
+            request.validate(),
+            Err(ContractError::Invalid("output_format_name"))
+        );
+
+        request.output_format_name = None;
+        request.output_schema_json = None;
+        request.input.push(CodexInputItem::ToolResult {
+            call_id: "x".repeat(65),
+            output: "evidence".to_string(),
+        });
+        assert_eq!(
+            request.validate(),
+            Err(ContractError::Invalid("input.call_id"))
         );
     }
 

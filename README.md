@@ -25,6 +25,11 @@ receipt binding their SHA-256. A consumer-native request digest is carried for
 audit correlation; the connector does not interpret or rederive consumer-native
 cognition.
 
+Tool choice, parallel-tool policy, provider-safe call IDs, strict tool schemas,
+structured-output naming, and the output-token bound are therefore caller-owned
+fields. The shared contract renders one deterministic Responses body and
+refuses inputs that would require the daemon to rename, project, or repair them.
+
 Tool calls are typed output. The connector never executes them.
 
 The encrypted envelope contains only MessagePack contracts and an AES-256-GCM
