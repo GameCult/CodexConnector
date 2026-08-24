@@ -1,6 +1,9 @@
 use std::collections::HashSet;
+#[cfg(feature = "client")]
 use std::io::{Read, Write};
+#[cfg(feature = "client")]
 use std::net::{SocketAddr, TcpStream};
+#[cfg(feature = "client")]
 use std::time::Duration;
 
 #[cfg(feature = "daemon")]
@@ -8,14 +11,18 @@ use std::collections::HashMap;
 #[cfg(feature = "daemon")]
 use std::path::Path;
 
+#[cfg(feature = "client")]
 use aes_gcm::aead::{Aead, Payload};
+#[cfg(feature = "client")]
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 #[cfg(feature = "daemon")]
 use cultcache_rs::{CultCache, DatabaseEntry, OwnedRedbMessagePackBackingStore};
+#[cfg(feature = "client")]
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+#[cfg(feature = "client")]
 use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(feature = "daemon")]
@@ -59,9 +66,11 @@ pub const RESULT_SCHEMA_ID: &str = "gamecult.codex.transport_result.v2";
 pub const RECEIPT_SCHEMA_ID: &str = "gamecult.codex.transport_receipt.v2";
 pub const ENVELOPE_SCHEMA_ID: &str = "gamecult.codex.transport_envelope.v2";
 
+#[cfg(feature = "client")]
 #[derive(Clone, PartialEq, Eq)]
 pub struct CodexTransportKey([u8; 32]);
 
+#[cfg(feature = "client")]
 impl CodexTransportKey {
     pub fn from_connection_secret(secret: &str) -> Result<Self, ServiceError> {
         if secret.trim().is_empty() || secret.trim() != secret {
@@ -71,6 +80,7 @@ impl CodexTransportKey {
     }
 }
 
+#[cfg(feature = "client")]
 impl Drop for CodexTransportKey {
     fn drop(&mut self) {
         self.0.zeroize();
@@ -634,12 +644,14 @@ pub fn canonical_invocation_bytes(
     rmp_serde::to_vec(invocation).map_err(|_| ContractError::Encoding)
 }
 
+#[cfg(feature = "client")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CodexEnvelopeKind {
     Invocation,
     Result,
 }
 
+#[cfg(feature = "client")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodexTransportEnvelope {
     pub schema_id: String,
@@ -650,6 +662,7 @@ pub struct CodexTransportEnvelope {
     pub ciphertext: Vec<u8>,
 }
 
+#[cfg(feature = "client")]
 pub fn encrypt_invocation(
     invocation: &CodexTransportInvocation,
     security: &CodexTransportKey,
@@ -664,6 +677,7 @@ pub fn encrypt_invocation(
     )
 }
 
+#[cfg(feature = "client")]
 pub fn decrypt_invocation(
     envelope: &CodexTransportEnvelope,
     security: &CodexTransportKey,
@@ -680,6 +694,7 @@ pub fn decrypt_invocation(
     Ok(invocation)
 }
 
+#[cfg(feature = "client")]
 pub fn encrypt_result(
     result: &CodexTransportResult,
     security: &CodexTransportKey,
@@ -694,6 +709,7 @@ pub fn encrypt_result(
     )
 }
 
+#[cfg(feature = "client")]
 pub fn decrypt_result(
     envelope: &CodexTransportEnvelope,
     security: &CodexTransportKey,
@@ -712,6 +728,7 @@ pub fn decrypt_result(
     Ok(result)
 }
 
+#[cfg(feature = "client")]
 #[derive(Clone)]
 pub struct CodexConnectorClient {
     endpoint: SocketAddr,
@@ -720,6 +737,7 @@ pub struct CodexConnectorClient {
     response_timeout: Option<Duration>,
 }
 
+#[cfg(feature = "client")]
 impl CodexConnectorClient {
     pub fn new(
         endpoint: SocketAddr,
@@ -770,6 +788,7 @@ impl CodexConnectorClient {
     }
 }
 
+#[cfg(feature = "client")]
 #[derive(Debug, Error)]
 pub enum CodexConnectorClientError {
     #[error("invalid connector client configuration")]
@@ -784,12 +803,14 @@ pub enum CodexConnectorClientError {
     Transport(#[from] ServiceError),
 }
 
+#[cfg(feature = "client")]
 #[derive(Debug)]
 enum TransportFrameError {
     Connection(std::io::Error),
     Size,
 }
 
+#[cfg(feature = "client")]
 fn client_frame_error(error: TransportFrameError) -> CodexConnectorClientError {
     match error {
         TransportFrameError::Connection(error) => CodexConnectorClientError::Connection(error),
@@ -797,6 +818,7 @@ fn client_frame_error(error: TransportFrameError) -> CodexConnectorClientError {
     }
 }
 
+#[cfg(feature = "client")]
 fn read_transport_frame(
     reader: &mut impl Read,
     max_frame_bytes: usize,
@@ -816,6 +838,7 @@ fn read_transport_frame(
     Ok(payload)
 }
 
+#[cfg(feature = "client")]
 fn write_transport_frame(
     writer: &mut impl Write,
     payload: &[u8],
@@ -831,6 +854,7 @@ fn write_transport_frame(
         .map_err(TransportFrameError::Connection)
 }
 
+#[cfg(feature = "client")]
 fn encrypt_message(
     caller_runtime_id: &str,
     request_id: &str,
@@ -868,6 +892,7 @@ fn encrypt_message(
     })
 }
 
+#[cfg(feature = "client")]
 fn decrypt_message(
     envelope: &CodexTransportEnvelope,
     security: &CodexTransportKey,
@@ -890,6 +915,7 @@ fn decrypt_message(
         .map_err(|_| ServiceError::Encryption)
 }
 
+#[cfg(feature = "client")]
 fn envelope_aad(
     schema_id: &str,
     caller_runtime_id: &str,
@@ -900,6 +926,7 @@ fn envelope_aad(
         .map_err(|_| ServiceError::Encoding)
 }
 
+#[cfg(feature = "client")]
 fn validate_envelope(
     envelope: &CodexTransportEnvelope,
     expected_kind: CodexEnvelopeKind,
@@ -1643,6 +1670,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(feature = "client")]
     fn security(key: &str) -> CodexTransportKey {
         CodexTransportKey::from_connection_secret(key).unwrap()
     }
@@ -1654,6 +1682,7 @@ mod tests {
         CodexTransportInvocation::new(caller_runtime_id, 2_000, [7; 32], request).unwrap()
     }
 
+    #[cfg(feature = "client")]
     #[test]
     fn encrypted_invocation_hides_content_and_binds_outer_identity() {
         let invocation = invocation();
@@ -1682,6 +1711,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "client")]
     #[test]
     fn shared_client_transports_one_exact_encrypted_request_and_result() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
