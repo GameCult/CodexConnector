@@ -5,17 +5,27 @@ subscription inference. Epiphany and Ghostlight remain separate minds. They
 derive their own exact provider requests, execute their own tools, interpret
 their own results, and admit their own state.
 
-The connector owns one writable credential/refresh store, authenticated caller
-admission, bounded transport physiology, exact provider-request receipts, and
-redacted CultMesh health. It owns no prompt policy or decision authority.
+The service owns authenticated caller admission, bounded transport physiology,
+exact provider-request receipts, and redacted CultMesh health. A private pinned
+official `codex app-server` child is the sole writer and refresh authority for
+one credential store. The public connector reads the credential only after the
+child's private auth RPC completes, then performs the exact Responses request.
+It owns no prompt policy or decision authority.
 
-The current source establishes the v2 typed contract and its transport-neutral
-service core before adding the daemon shell. The core admits distinct caller
-keys and policies, returns an exact cached response for byte-identical retries,
-refuses conflicting or concurrent reuse of one caller/request identity, and
-leaves provider execution outside its lock. The existing Yggdrasil connector
-already proves the process seam, but its single-caller, fixed-model, stateless,
-no-tools wire law cannot become the shared contract by inertia.
+The current source establishes the v2 typed contract, its transport-neutral
+service core, and the private Codex-auth/provider backend before adding the
+public listener shell. The core admits distinct caller keys and policies,
+returns an exact cached response for byte-identical retries, refuses conflicting
+or concurrent reuse of one caller/request identity, and leaves provider
+execution outside its lock. The backend verifies the exact child binary and
+reported Codex home, limits child RPC to authentication, reads API-key or
+ChatGPT credentials without publishing their identity, retries one ChatGPT 401
+only after the official writer advances the credential store, and lowers raw
+SSE into typed text, tool-call, usage, and failure receipts.
+
+No upstream Codex crate is linked into the package. The official binary is a
+pinned deployment input, keeping Codex's application build graph outside both
+consumers and this small daemon.
 
 ## Contract invariant
 

@@ -7,6 +7,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+mod provider_backend;
+
+pub use provider_backend::CodexAppServerConfig;
+pub use provider_backend::CodexAuthMode;
+pub use provider_backend::CodexAuthReadiness;
+pub use provider_backend::CodexProviderBackend;
+pub use provider_backend::CodexProviderBackendError;
+
 pub const PROVIDER_REQUEST_SCHEMA_ID: &str = "gamecult.codex.provider_request.v2";
 pub const INVOCATION_SCHEMA_ID: &str = "gamecult.codex.transport_invocation.v2";
 pub const RESULT_SCHEMA_ID: &str = "gamecult.codex.transport_result.v2";

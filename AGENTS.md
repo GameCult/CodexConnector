@@ -7,11 +7,18 @@ owner, tool executor, decision store, or consumer runtime.
 Keep one Cargo package and one production daemon entrypoint. Add another target
 only when an independent lifecycle or privilege invariant requires it.
 
-The daemon may own credential loading and refresh, upstream client identity,
-authenticated caller admission, bounded concurrency/replay, provider transport,
-typed events, and transport receipts. Consumers own native requests, provider
-lowering, prompts, schemas, tool execution, retry between passes, interpretation,
-decisions, and state admission.
+The public daemon owns upstream client identity, authenticated caller admission,
+bounded concurrency/replay, provider transport, typed events, and transport
+receipts. A private pinned official `codex app-server` child is the sole
+credential-store writer and refresh authority. The daemon may read its
+credential only after their private auth RPC completes; it may never write or
+repair the store. Consumers own native requests, provider lowering, prompts,
+schemas, tool execution, retry between passes, interpretation, decisions, and
+state admission.
+
+Do not link upstream Codex crates into this package. Idunn freezes the official
+Codex binary as an exact package input. The child receives auth RPC only, never
+consumer identity, prompts, tools, provider requests, or model output.
 
 Use typed Rust contracts, CultCache state, CultNet transport, and CultMesh/Eve
 projection. JSON is permitted only at the upstream provider boundary or for
