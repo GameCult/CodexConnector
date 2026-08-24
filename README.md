@@ -12,11 +12,13 @@ one credential store. The public connector reads the credential only after the
 child's private auth RPC completes, then performs the exact Responses request.
 It owns no prompt policy or decision authority.
 
-The default library is the shared consumer ABI: v2 typed contracts, exact
-provider lowering, encryption, bounded direct-pipe framing, one-request socket
-transport, and exact result validation. It does not compile CultCache, HTTP,
-TLS, provider auth, replay, or daemon code. Epiphany and Ghostlight consume this
-surface instead of copying wire law.
+The library has three explicit compile surfaces. With no features it exposes
+only the v2 provider/result contracts and their deterministic validation. The
+default `client` feature adds encryption, bounded direct-pipe framing, and the
+one-request socket client. It still compiles no CultCache, HTTP, TLS, provider
+auth, replay, or daemon code. The `daemon` feature includes the client surface
+and the service. Epiphany and Ghostlight can therefore type and seal their exact
+provider requests without importing transport physiology into their Minds.
 
 Connection establishment is bounded independently. Response read/write timeout
 is optional so a consumer's typed outer pass may remain the sole deadline owner.
@@ -45,9 +47,10 @@ No upstream Codex crate is linked into the package. The official binary is a
 pinned deployment input, keeping Codex's application build graph outside both
 consumers and this small daemon.
 
-Focused verification uses the two real build surfaces:
+Focused verification proves each real build surface independently:
 
 ```text
+cargo test --lib --no-default-features
 cargo test --lib
 cargo test --lib --features daemon
 cargo check --bin codex-connector --features daemon

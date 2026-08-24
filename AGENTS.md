@@ -16,6 +16,12 @@ repair the store. Consumers own native requests, provider lowering, prompts,
 schemas, tool execution, retry between passes, interpretation, decisions, and
 state admission.
 
+Keep the feature boundary exact. `--no-default-features` is the contract-only
+surface used where a Mind seals provider request bytes. The default `client`
+surface adds only authenticated framing and socket transport. `daemon` adds the
+service authorities. Contract-only consumers must not compile client crypto or
+socket physiology by accident.
+
 Do not link upstream Codex crates into this package. Idunn freezes the official
 Codex binary as an exact package input. The child receives auth RPC only, never
 consumer identity, prompts, tools, provider requests, or model output.
