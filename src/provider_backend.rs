@@ -500,7 +500,7 @@ fn parse_responses_sse(reader: impl Read) -> Result<ParsedProviderStream, &'stat
             .by_ref()
             .take((MAX_SSE_FRAME_BYTES + 1) as u64)
             .read_until(b'\n', &mut line)
-            .map_err(|_| "provider SSE read failed")?;
+            .map_err(|error| provider_sse_read_error(error.kind()))?;
         if read == 0 {
             if !data.is_empty() {
                 state.accept_frame(&data)?;
@@ -542,6 +542,18 @@ fn parse_responses_sse(reader: impl Read) -> Result<ParsedProviderStream, &'stat
         events: state.events,
         outcome,
     })
+}
+
+fn provider_sse_read_error(kind: io::ErrorKind) -> &'static str {
+    match kind {
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => "provider SSE read timed out",
+        io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::NotConnected
+        | io::ErrorKind::UnexpectedEof => "provider SSE connection closed unexpectedly",
+        _ => "provider SSE read failed",
+    }
 }
 
 fn failed_result(
@@ -1037,6 +1049,14 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
 
+    struct FailingReader(io::ErrorKind);
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(self.0))
+        }
+    }
+
     fn jwt(payload: Value) -> String {
         let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
         format!("e30.{payload}.signature")
@@ -1210,6 +1230,32 @@ mod tests {
         assert_eq!(
             parse_responses_sse(stream.as_bytes()).err(),
             Some("provider completed with an unfinished tool call")
+        );
+    }
+
+    #[test]
+    fn responses_stream_classifies_read_failures_without_exposing_io_details() {
+        for kind in [io::ErrorKind::TimedOut, io::ErrorKind::WouldBlock] {
+            assert_eq!(
+                parse_responses_sse(FailingReader(kind)).unwrap_err(),
+                "provider SSE read timed out"
+            );
+        }
+        for kind in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            assert_eq!(
+                parse_responses_sse(FailingReader(kind)).unwrap_err(),
+                "provider SSE connection closed unexpectedly"
+            );
+        }
+        assert_eq!(
+            parse_responses_sse(FailingReader(io::ErrorKind::Other)).unwrap_err(),
+            "provider SSE read failed"
         );
     }
 
