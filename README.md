@@ -13,8 +13,12 @@ child's private auth RPC completes, then performs the exact Responses request.
 It owns no prompt policy or decision authority.
 
 The current source establishes the v2 typed contract, its transport-neutral
-service core, and the private Codex-auth/provider backend before adding the
-public listener shell. The core admits distinct caller keys and policies,
+service core, the private Codex-auth/provider backend, and one public daemon
+entrypoint. The daemon reads one typed CultCache configuration document, binds
+only loopback, uses CultNet's four-byte big-endian direct-pipe framing around
+the encrypted MessagePack envelope, bounds connection threads and frame sizes,
+and keeps provider execution outside the service-state lock. The core admits
+distinct caller keys and policies,
 returns an exact cached response for byte-identical retries, refuses conflicting
 or concurrent reuse of one caller/request identity, and leaves provider
 execution outside its lock. The backend verifies the exact child binary and
@@ -26,6 +30,11 @@ SSE into typed text, tool-call, usage, and failure receipts.
 No upstream Codex crate is linked into the package. The official binary is a
 pinned deployment input, keeping Codex's application build graph outside both
 consumers and this small daemon.
+
+This is not yet a deployable replacement for the live connector. Persistent
+replay recovery, redacted CultMesh/Odin publication, shared consumer client
+cuts, and the independent Idunn target remain open. The old daemon remains the
+sole live credential writer until those proofs land.
 
 ## Contract invariant
 

@@ -37,6 +37,7 @@ pub struct CodexAppServerConfig {
     pub executable: PathBuf,
     pub executable_sha256: [u8; 32],
     pub codex_home: PathBuf,
+    pub max_result_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,10 +57,17 @@ pub struct CodexAuthReadiness {
 pub struct CodexProviderBackend {
     authority: Mutex<CodexAppServerAuthority>,
     http: ureq::Agent,
+    max_result_bytes: usize,
 }
 
 impl CodexProviderBackend {
     pub fn start(config: CodexAppServerConfig) -> Result<Self, CodexProviderBackendError> {
+        if config.max_result_bytes < 4096 {
+            return Err(CodexProviderBackendError::InvalidConfiguration(
+                "max_result_bytes",
+            ));
+        }
+        let max_result_bytes = config.max_result_bytes;
         let http: ureq::Agent = ureq::Agent::config_builder()
             .timeout_connect(Some(Duration::from_secs(30)))
             .timeout_recv_response(Some(Duration::from_secs(30)))
@@ -70,6 +78,7 @@ impl CodexProviderBackend {
         Ok(Self {
             authority: Mutex::new(CodexAppServerAuthority::spawn(config)?),
             http,
+            max_result_bytes,
         })
     }
 
@@ -82,7 +91,23 @@ impl CodexProviderBackend {
         Ok(credential.redacted(&authority.app_server_user_agent))
     }
 
-    pub fn execute(
+    pub fn execute(&self, invocation: &CodexTransportInvocation) -> CodexTransportResult {
+        match self.try_execute(invocation) {
+            Ok(result) => result,
+            Err(CodexProviderBackendError::ProviderRequest) => failed_result(
+                invocation,
+                "provider_request",
+                "provider request could not be rendered",
+            ),
+            Err(_) => failed_result(
+                invocation,
+                "credential_authority",
+                "Codex credential authority failed",
+            ),
+        }
+    }
+
+    fn try_execute(
         &self,
         invocation: &CodexTransportInvocation,
     ) -> Result<CodexTransportResult, CodexProviderBackendError> {
@@ -168,11 +193,18 @@ impl CodexProviderBackend {
             transport: TRANSPORT_ID.to_string(),
             outcome: parsed.outcome,
         };
-        Ok(CodexTransportResult::transported(
-            invocation,
-            parsed.events,
-            receipt,
-        ))
+        let result = CodexTransportResult::transported(invocation, parsed.events, receipt);
+        if rmp_serde::to_vec(&result)
+            .map(|bytes| bytes.len() > self.max_result_bytes)
+            .unwrap_or(true)
+        {
+            return Ok(failed_result(
+                invocation,
+                "result_size",
+                "provider result exceeded its byte bound",
+            ));
+        }
+        Ok(result)
     }
 }
 

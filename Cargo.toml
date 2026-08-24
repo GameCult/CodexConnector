@@ -11,9 +11,14 @@ repository = "https://github.com/GameCult/CodexConnector"
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "codex-connector"
+path = "src/main.rs"
+
 [dependencies]
 aes-gcm = "0.10"
 base64 = "0.23"
+cultcache-rs = { git = "https://github.com/GameCult/cultcache-rs.git", rev = "fdbf3bf0a4b3f6b617c224d7439feb8e69d4474c" }
 rand_core = { version = "0.6", features = ["getrandom"] }
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }

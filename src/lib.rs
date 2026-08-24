@@ -6,9 +6,17 @@ use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
+mod daemon;
 mod provider_backend;
 
+pub use daemon::CodexCallerConfig;
+pub use daemon::CodexDaemonConfig;
+pub use daemon::CodexDaemonError;
+pub use daemon::load_daemon_config;
+pub use daemon::serve;
+pub use daemon::write_daemon_config;
 pub use provider_backend::CodexAppServerConfig;
 pub use provider_backend::CodexAuthMode;
 pub use provider_backend::CodexAuthReadiness;
@@ -782,8 +790,8 @@ impl CodexCallerAdmission {
         {
             return Err(ServiceError::InvalidAdmission);
         }
-        let connection_key = connection_key.into();
-        let security = CodexTransportKey::from_connection_secret(&connection_key)?;
+        let connection_key = Zeroizing::new(connection_key.into());
+        let security = CodexTransportKey::from_connection_secret(connection_key.as_str())?;
         Ok(Self {
             caller_runtime_id,
             security,
