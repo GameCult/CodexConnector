@@ -398,7 +398,7 @@ pub enum CodexDaemonError {
     #[error("connector request thread failed")]
     Thread(#[source] std::io::Error),
     #[cfg(target_os = "linux")]
-    #[error("connector health publication could not start")]
+    #[error("connector health publication could not start: {0}")]
     Health(#[source] anyhow::Error),
     #[cfg(target_os = "linux")]
     #[error("connector health thread could not start")]

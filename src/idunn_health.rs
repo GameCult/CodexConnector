@@ -28,7 +28,9 @@ const SIGNATURE_DOMAIN: &[u8] = b"gamecult.provider-health.signature.v1\0";
 const SIGNATURE_PURPOSE: &[u8] = b"idunn.signed_daemon_health.v1";
 const PROTECTOR_CONTEXT: &str = "gamecult-provider-health-identity-v1";
 const RUDP_PROTOCOL_ID: &str = "cultnet.transport.rudp.v0";
-const RUDP_CONNECTION_ID: u32 = 0x1d0d_0004;
+// Idunn's daemon-health ingress owns one shared RUDP connection contract.
+// Publisher identity is carried by the signed record, not by transport IDs.
+const RUDP_CONNECTION_ID: u32 = 0x1d0d_0001;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct ProviderHealthIdentity {
