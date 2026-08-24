@@ -22,4 +22,3 @@ Before broad compilation, name the exact package/target/profile, output root,
 current footprint, and retention decision. Focused library checks and tests are
 the default. Code and tests must buy consequential behavior; delete mirrors,
 wrappers, compatibility paths, and self-certifying status surfaces.
-

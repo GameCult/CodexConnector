@@ -23,4 +23,3 @@ audit correlation; the connector does not interpret or rederive consumer-native
 cognition.
 
 Tool calls are typed output. The connector never executes them.
-
