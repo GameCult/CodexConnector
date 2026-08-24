@@ -1,0 +1,261 @@
+CodexConnector Repository License Notice
+=======================================
+
+This repository is a multi-license distribution. Different parts of the
+repository are available under different terms.
+
+Nothing in this file narrows, revokes, or relabels rights already granted by
+upstream licenses. In particular, nothing in this file should be read as
+withdrawing any permission granted by Apache License 2.0 for Apache-covered
+material.
+
+1. Scope
+--------
+
+For this file:
+
+- `Project-Authored Material` means original software, documentation, and other
+  repository content authored for CodexConnector, except where a file or
+  directory states different terms.
+- `Upstream Material` means material copied or adapted from third parties and
+  distributed under their own licenses.
+- `Mixed Apache Files` means files under `vendor/codex/**` that contain
+  project-authored changes on top of upstream Apache-licensed material.
+
+2. Upstream And Third-Party Material
+------------------------------------
+
+- All material under `vendor/codex/**` remains subject to its upstream licenses
+  and notices, including Apache License 2.0 at `vendor/codex/LICENSE` and any
+  applicable `NOTICE` or file-level notices.
+- Other third-party material distributed with the repository keeps its own
+  license terms where provided.
+- You must continue to comply with those upstream terms when using,
+  redistributing, or modifying upstream material.
+
+3. Public License For Project-Authored Material
+-----------------------------------------------
+
+Except where a file or directory says otherwise, Project-Authored Material
+outside `vendor/codex/**` is licensed to the public under:
+
+- PolyForm Noncommercial License 1.0.0
+
+The full text of that license appears in Appendix A of this file.
+
+Required Notice: Copyright 2026 CodexConnector authors and contributors.
+
+4. Commercial License Option
+----------------------------
+
+If you want to use Project-Authored Material for any purpose not permitted by
+PolyForm Noncommercial License 1.0.0, you must obtain a separate written
+commercial license from the applicable copyright holder or another party
+expressly authorized in writing to grant that license.
+
+Commercial rights are not granted by:
+
+- source availability
+- public access to this repository
+- silence
+- estoppel by implication
+- the fact that the licensors are not yet organized as a corporation or LLC
+
+A natural person can own and license copyright. Until a separate business
+entity is formed and designated in writing, any commercial license for
+Project-Authored Material may be offered directly by the individual copyright
+holder or holders.
+
+5. Mixed Apache Files Under `vendor/codex/**`
+---------------------------------------------
+
+Some files under `vendor/codex/**` contain project-authored changes layered on
+top of upstream Apache-licensed code.
+
+For those files:
+
+- Apache License 2.0 and the applicable upstream notices still apply.
+- You must not read this repository notice as converting those files into a
+  PolyForm-only codebase.
+- To the extent the project owns copyright in new additions to those files, the
+  project may also offer separate commercial terms for its own contributions.
+- This repository notice does not claim to erase or retract Apache-2.0
+  permissions already granted for Apache-covered material.
+
+The strongest commercial boundary in this repository therefore applies to
+clearly separable Project-Authored Material outside `vendor/codex/**`,
+including `src/**` and other non-vendored project files.
+
+6. Open Source Status
+---------------------
+
+Because the public license path for Project-Authored Material is PolyForm
+Noncommercial License 1.0.0 rather than an OSI-approved license, the
+repository as a whole is source-available and dual-licensed. It is not an OSI
+Open Source distribution as a whole.
+
+7. Reference Structures
+-----------------------
+
+This licensing structure intentionally borrows the general dual-license shape
+used by established projects such as Qt and MySQL:
+
+- one public-facing license path
+- one separate commercial license path
+
+This repository does not claim that Qt or MySQL use the same exact public
+license terms used here. Those projects are referenced only as structural
+examples of dual licensing, not as the operative terms of this repository.
+
+8. Contributions
+----------------
+
+External contributions are accepted only under the CodexConnector Contributor
+License Agreement in `CONTRIBUTOR_LICENSE_AGREEMENT.md`, or under a separate
+written agreement accepted by the Project Steward.
+
+The contributor agreement is intentionally broad. Contributors keep ownership
+of their contributions, but grant the Project Steward the right to sublicense
+and relicense those contributions under any license or terms the Project
+Steward chooses, including commercial or proprietary terms.
+
+The project should not accept non-trivial outside contributions unless the
+contributor has agreed to that contributor agreement or an equivalent written
+agreement.
+
+Appendix A: PolyForm Noncommercial License 1.0.0
+------------------------------------------------
+
+The following text is included as the operative public license for
+Project-Authored Material described in Section 3.
+
+# PolyForm Noncommercial License 1.0.0
+
+<https://polyformproject.org/licenses/noncommercial/1.0.0>
+
+## Acceptance
+
+In order to get any license under these terms, you must agree
+to them as both strict obligations and conditions to all
+your licenses.
+
+## Copyright License
+
+The licensor grants you a copyright license for the
+software to do everything you might do with the software
+that would otherwise infringe the licensor's copyright
+in it for any permitted purpose. However, you may
+only distribute the software according to Distribution
+License and make changes or new works based on the software
+according to Changes and New Works License.
+
+## Distribution License
+
+The licensor grants you an additional copyright license
+to distribute copies of the software. Your license
+to distribute covers distributing the software with
+changes and new works permitted by Changes and New Works
+License.
+
+## Notices
+
+You must ensure that anyone who gets a copy of any part of
+the software from you also gets a copy of these terms or the
+URL for them above, as well as copies of any plain-text lines
+beginning with `Required Notice:` that the licensor provided
+with the software. For example:
+
+> Required Notice: Copyright Yoyodyne, Inc. (http://example.com)
+
+## Changes and New Works License
+
+The licensor grants you an additional copyright license to
+make changes and new works based on the software for any
+permitted purpose.
+
+## Patent License
+
+The licensor grants you a patent license for the software that
+covers patent claims the licensor can license, or becomes able
+to license, that you would infringe by using the software.
+
+## Noncommercial Purposes
+
+Any noncommercial purpose is a permitted purpose.
+
+## Personal Uses
+
+Personal use for research, experiment, and testing for
+the benefit of public knowledge, personal study, private
+entertainment, hobby projects, amateur pursuits, or religious
+observance, without any anticipated commercial application,
+is use for a permitted purpose.
+
+## Noncommercial Organizations
+
+Use by any charitable organization, educational institution,
+public research organization, public safety or health
+organization, environmental protection organization,
+or government institution is use for a permitted purpose
+regardless of the source of funding or obligations resulting
+from the funding.
+
+## Fair Use
+
+You may have "fair use" rights for the software under the
+law. These terms do not limit them.
+
+## No Other Rights
+
+These terms do not allow you to sublicense or transfer any of
+your licenses to anyone else, or prevent the licensor from
+granting licenses to anyone else. These terms do not imply
+any other licenses.
+
+## Patent Defense
+
+If you make any written claim that the software infringes or
+contributes to infringement of any patent, your patent license
+for the software granted under these terms ends immediately. If
+your company makes such a claim, your patent license ends
+immediately for work on behalf of your company.
+
+## Violations
+
+The first time you are notified in writing that you have
+violated any of these terms, or done anything with the software
+not covered by your licenses, your licenses can nonetheless
+continue if you come into full compliance with these terms,
+and take practical steps to correct past violations, within
+32 days of receiving notice. Otherwise, all your licenses
+end immediately.
+
+## No Liability
+
+As far as the law allows, the software comes as is, without
+any warranty or condition, and the licensor will not be liable
+to you for any damages arising out of these terms or the use
+or nature of the software, under any kind of legal claim.
+
+## Definitions
+
+The licensor is the individual or entity offering these
+terms, and the software is the software the licensor makes
+available under these terms.
+
+You refers to the individual or entity agreeing to these
+terms.
+
+Your company is any legal entity, sole proprietorship,
+or other kind of organization that you work for, plus all
+organizations that have control over, are under the control of,
+or are under common control with that organization. Control
+means ownership of substantially all the assets of an entity,
+or the power to direct its management and policies by vote,
+contract, or otherwise. Control can be direct or indirect.
+
+Your licenses are all the licenses granted to you for the
+software under these terms.
+
+Use means anything you do with the software requiring one
+of your licenses.
