@@ -190,6 +190,8 @@ pub fn serve(config_path: &Path) -> Result<(), CodexDaemonError> {
         config.callers.len(),
         readiness.auth_mode
     );
+    #[cfg(target_os = "linux")]
+    start_idunn_health_publisher()?;
 
     for accepted in listener.incoming() {
         let stream = match accepted {
@@ -222,6 +224,52 @@ pub fn serve(config_path: &Path) -> Result<(), CodexDaemonError> {
             .map_err(CodexDaemonError::Thread)?;
     }
     Err(CodexDaemonError::ListenerClosed)
+}
+
+#[cfg(target_os = "linux")]
+fn start_idunn_health_publisher() -> Result<(), CodexDaemonError> {
+    let Some(endpoint) = std::env::var_os("CODEX_CONNECTOR_IDUNN_RUDP") else {
+        return Ok(());
+    };
+    let endpoint = endpoint
+        .to_string_lossy()
+        .parse::<SocketAddr>()
+        .map_err(|_| CodexDaemonError::InvalidConfig("Idunn health endpoint"))?;
+    let daemon_id = required_environment("CODEX_CONNECTOR_IDUNN_DAEMON")?;
+    let runtime_id = required_environment("CODEX_CONNECTOR_RUNTIME_ID")?;
+    let contract = std::env::var("CODEX_CONNECTOR_IDUNN_HEALTH_CONTRACT")
+        .unwrap_or_else(|_| crate::CODEX_CONNECTOR_IDUNN_HEALTH_CONTRACT.to_string());
+    let identity = PathBuf::from(required_environment(
+        "CODEX_CONNECTOR_IDUNN_HEALTH_IDENTITY",
+    )?);
+    let mut publisher =
+        crate::ProviderHealthPublisher::open(endpoint, daemon_id, runtime_id, contract, &identity)
+            .map_err(CodexDaemonError::Health)?;
+    publisher
+        .publish("active", "credential-isolated-transport-ready")
+        .map_err(CodexDaemonError::Health)?;
+    thread::Builder::new()
+        .name("codex-connector-health".to_string())
+        .spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(10));
+                if let Err(error) =
+                    publisher.publish("active", "credential-isolated-transport-ready")
+                {
+                    eprintln!("codex-connector health publication failed: {error}");
+                }
+            }
+        })
+        .map_err(CodexDaemonError::HealthThread)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn required_environment(name: &'static str) -> Result<String, CodexDaemonError> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty() && value == value.trim())
+        .ok_or(CodexDaemonError::InvalidConfig(name))
 }
 
 fn load_admissions(
@@ -349,6 +397,12 @@ pub enum CodexDaemonError {
     Listen(#[source] std::io::Error),
     #[error("connector request thread failed")]
     Thread(#[source] std::io::Error),
+    #[cfg(target_os = "linux")]
+    #[error("connector health publication could not start")]
+    Health(#[source] anyhow::Error),
+    #[cfg(target_os = "linux")]
+    #[error("connector health thread could not start")]
+    HealthThread(#[source] std::io::Error),
     #[error("connector connection failed")]
     Connection(#[source] std::io::Error),
     #[error("connector frame exceeded its bound")]

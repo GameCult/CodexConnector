@@ -1,0 +1,4 @@
+schema_version=gamecult.codex_connector.codex_toolchain.v1
+package_url=https://registry.npmjs.org/@openai/codex/-/codex-0.150.0-alpha.7-linux-x64.tgz
+package_sha256=8aca3112aef60127d4ffaf4c6f08e524fa7315279a1d08e7aa9c5e7f1a6943e0
+binary_sha256=aca268dc02dcef8b1ea9f528a10173d5071ae76d659a03cce6458bbebe228bee

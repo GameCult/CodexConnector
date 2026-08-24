@@ -55,9 +55,10 @@ cargo check --bin codex-connector --features daemon
 
 The same production binary can initialize a typed single-caller `.cc`
 configuration for first deployment, then serve only from that admitted state.
-Redacted CultMesh/Odin publication and the independent Idunn target remain
-open. The old daemon remains the sole live credential writer until that
-deployment transaction lands.
+The daemon publishes private-free signed health to Idunn from its own runtime
+identity. Its source revision also owns the exact Codex Linux package and
+binary hashes in `deployment/codex-linux-x64.manifest`, so changing the provider
+toolchain necessarily changes the connector release selected by Idunn.
 
 ## Contract invariant
 
