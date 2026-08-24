@@ -1237,8 +1237,8 @@ mod tests {
     fn responses_stream_classifies_read_failures_without_exposing_io_details() {
         for kind in [io::ErrorKind::TimedOut, io::ErrorKind::WouldBlock] {
             assert_eq!(
-                parse_responses_sse(FailingReader(kind)).unwrap_err(),
-                "provider SSE read timed out"
+                parse_responses_sse(FailingReader(kind)).err(),
+                Some("provider SSE read timed out")
             );
         }
         for kind in [
@@ -1249,13 +1249,13 @@ mod tests {
             io::ErrorKind::UnexpectedEof,
         ] {
             assert_eq!(
-                parse_responses_sse(FailingReader(kind)).unwrap_err(),
-                "provider SSE connection closed unexpectedly"
+                parse_responses_sse(FailingReader(kind)).err(),
+                Some("provider SSE connection closed unexpectedly")
             );
         }
         assert_eq!(
-            parse_responses_sse(FailingReader(io::ErrorKind::Other)).unwrap_err(),
-            "provider SSE read failed"
+            parse_responses_sse(FailingReader(io::ErrorKind::Other)).err(),
+            Some("provider SSE read failed")
         );
     }
 
