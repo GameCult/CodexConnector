@@ -1,5 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
+use aes_gcm::aead::{Aead, Payload};
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -8,6 +11,19 @@ pub const PROVIDER_REQUEST_SCHEMA_ID: &str = "gamecult.codex.provider_request.v2
 pub const INVOCATION_SCHEMA_ID: &str = "gamecult.codex.transport_invocation.v2";
 pub const RESULT_SCHEMA_ID: &str = "gamecult.codex.transport_result.v2";
 pub const RECEIPT_SCHEMA_ID: &str = "gamecult.codex.transport_receipt.v2";
+pub const ENVELOPE_SCHEMA_ID: &str = "gamecult.codex.transport_envelope.v2";
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct CodexTransportKey([u8; 32]);
+
+impl CodexTransportKey {
+    pub fn from_connection_secret(secret: &str) -> Result<Self, ServiceError> {
+        if secret.trim().is_empty() || secret.trim() != secret {
+            return Err(ServiceError::InvalidAdmission);
+        }
+        Ok(Self(Sha256::digest(secret.as_bytes()).into()))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodexProviderRequest {
@@ -200,61 +216,62 @@ impl CodexTransportInvocation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CodexTransportResult {
-    Refused {
-        schema_id: String,
-        request_id: String,
-        caller_runtime_id: String,
-        reason: CodexRefusal,
-    },
+pub struct CodexTransportResult {
+    pub schema_id: String,
+    pub request_id: String,
+    pub caller_runtime_id: String,
+    pub disposition: CodexTransportDisposition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CodexTransportDisposition {
+    Refused(CodexRefusal),
     Transported {
-        schema_id: String,
-        request_id: String,
-        caller_runtime_id: String,
-        provider_request_sha256: [u8; 32],
         events: Vec<CodexTransportEvent>,
-        receipt: CodexTransportReceipt,
+        receipt: Box<CodexTransportReceipt>,
     },
 }
 
 impl CodexTransportResult {
+    pub fn refused(invocation: &CodexTransportInvocation, reason: CodexRefusal) -> Self {
+        Self {
+            schema_id: RESULT_SCHEMA_ID.to_string(),
+            request_id: invocation.request_id().to_string(),
+            caller_runtime_id: invocation.caller_runtime_id.clone(),
+            disposition: CodexTransportDisposition::Refused(reason),
+        }
+    }
+
+    pub fn transported(
+        invocation: &CodexTransportInvocation,
+        events: Vec<CodexTransportEvent>,
+        receipt: CodexTransportReceipt,
+    ) -> Self {
+        Self {
+            schema_id: RESULT_SCHEMA_ID.to_string(),
+            request_id: invocation.request_id().to_string(),
+            caller_runtime_id: invocation.caller_runtime_id.clone(),
+            disposition: CodexTransportDisposition::Transported {
+                events,
+                receipt: Box::new(receipt),
+            },
+        }
+    }
+
     pub fn validate_against(
         &self,
         invocation: &CodexTransportInvocation,
     ) -> Result<(), ContractError> {
-        let (schema_id, request_id, caller_runtime_id) = match self {
-            Self::Refused {
-                schema_id,
-                request_id,
-                caller_runtime_id,
-                ..
-            }
-            | Self::Transported {
-                schema_id,
-                request_id,
-                caller_runtime_id,
-                ..
-            } => (schema_id, request_id, caller_runtime_id),
-        };
-        if schema_id != RESULT_SCHEMA_ID {
+        if self.schema_id != RESULT_SCHEMA_ID {
             return Err(ContractError::Schema);
         }
-        if request_id != invocation.request_id()
-            || caller_runtime_id != &invocation.caller_runtime_id
+        if self.request_id != invocation.request_id()
+            || self.caller_runtime_id != invocation.caller_runtime_id
         {
             return Err(ContractError::Identity);
         }
 
-        if let Self::Transported {
-            provider_request_sha256,
-            events,
-            receipt,
-            ..
-        } = self
-        {
-            if provider_request_sha256 != &invocation.provider_request_sha256 {
-                return Err(ContractError::ProviderDigest);
-            }
+        if let CodexTransportDisposition::Transported { events, receipt } = &self.disposition {
             for (expected, event) in events.iter().enumerate() {
                 if event.sequence != expected as u64 {
                     return Err(ContractError::EventSequence);
@@ -373,11 +390,12 @@ pub enum CodexTransportOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CodexRefusal {
-    CallerNotAdmitted,
     Expired,
     IdentitySubstitution,
     ProviderDigestSubstitution,
     Policy,
+    Capacity,
+    InFlight,
     ReplayConflict,
     Malformed,
 }
@@ -391,6 +409,481 @@ pub fn canonical_provider_request_bytes(
 
 pub fn provider_request_sha256(request: &CodexProviderRequest) -> Result<[u8; 32], ContractError> {
     Ok(Sha256::digest(canonical_provider_request_bytes(request)?).into())
+}
+
+pub fn canonical_invocation_bytes(
+    invocation: &CodexTransportInvocation,
+) -> Result<Vec<u8>, ContractError> {
+    invocation.request.validate()?;
+    if invocation.provider_request_sha256 != provider_request_sha256(&invocation.request)? {
+        return Err(ContractError::ProviderDigest);
+    }
+    rmp_serde::to_vec(invocation).map_err(|_| ContractError::Encoding)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CodexEnvelopeKind {
+    Invocation,
+    Result,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexTransportEnvelope {
+    pub schema_id: String,
+    pub caller_runtime_id: String,
+    pub request_id: String,
+    pub message_kind: CodexEnvelopeKind,
+    pub nonce: [u8; 12],
+    pub ciphertext: Vec<u8>,
+}
+
+pub fn encrypt_invocation(
+    invocation: &CodexTransportInvocation,
+    security: &CodexTransportKey,
+) -> Result<CodexTransportEnvelope, ServiceError> {
+    let plaintext = canonical_invocation_bytes(invocation)?;
+    encrypt_message(
+        &invocation.caller_runtime_id,
+        invocation.request_id(),
+        CodexEnvelopeKind::Invocation,
+        &plaintext,
+        security,
+    )
+}
+
+pub fn decrypt_invocation(
+    envelope: &CodexTransportEnvelope,
+    security: &CodexTransportKey,
+) -> Result<CodexTransportInvocation, ServiceError> {
+    validate_envelope(envelope, CodexEnvelopeKind::Invocation)?;
+    let plaintext = decrypt_message(envelope, security)?;
+    let invocation: CodexTransportInvocation =
+        rmp_serde::from_slice(&plaintext).map_err(|_| ServiceError::Encoding)?;
+    if invocation.caller_runtime_id != envelope.caller_runtime_id
+        || invocation.request_id() != envelope.request_id
+    {
+        return Err(ServiceError::OuterIdentity);
+    }
+    Ok(invocation)
+}
+
+pub fn encrypt_result(
+    result: &CodexTransportResult,
+    security: &CodexTransportKey,
+) -> Result<CodexTransportEnvelope, ServiceError> {
+    let plaintext = rmp_serde::to_vec(result).map_err(|_| ServiceError::Encoding)?;
+    encrypt_message(
+        &result.caller_runtime_id,
+        &result.request_id,
+        CodexEnvelopeKind::Result,
+        &plaintext,
+        security,
+    )
+}
+
+pub fn decrypt_result(
+    envelope: &CodexTransportEnvelope,
+    security: &CodexTransportKey,
+    invocation: &CodexTransportInvocation,
+) -> Result<CodexTransportResult, ServiceError> {
+    validate_envelope(envelope, CodexEnvelopeKind::Result)?;
+    let plaintext = decrypt_message(envelope, security)?;
+    let result: CodexTransportResult =
+        rmp_serde::from_slice(&plaintext).map_err(|_| ServiceError::Encoding)?;
+    if result.caller_runtime_id != envelope.caller_runtime_id
+        || result.request_id != envelope.request_id
+    {
+        return Err(ServiceError::OuterIdentity);
+    }
+    result.validate_against(invocation)?;
+    Ok(result)
+}
+
+fn encrypt_message(
+    caller_runtime_id: &str,
+    request_id: &str,
+    message_kind: CodexEnvelopeKind,
+    plaintext: &[u8],
+    security: &CodexTransportKey,
+) -> Result<CodexTransportEnvelope, ServiceError> {
+    require_id(caller_runtime_id, "caller_runtime_id")?;
+    require_id(request_id, "request_id")?;
+    let mut nonce = [0; 12];
+    OsRng.fill_bytes(&mut nonce);
+    let cipher = Aes256Gcm::new_from_slice(&security.0).map_err(|_| ServiceError::Encryption)?;
+    let aad = envelope_aad(
+        ENVELOPE_SCHEMA_ID,
+        caller_runtime_id,
+        request_id,
+        message_kind,
+    )?;
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| ServiceError::Encryption)?;
+    Ok(CodexTransportEnvelope {
+        schema_id: ENVELOPE_SCHEMA_ID.to_string(),
+        caller_runtime_id: caller_runtime_id.to_string(),
+        request_id: request_id.to_string(),
+        message_kind,
+        nonce,
+        ciphertext,
+    })
+}
+
+fn decrypt_message(
+    envelope: &CodexTransportEnvelope,
+    security: &CodexTransportKey,
+) -> Result<Vec<u8>, ServiceError> {
+    let cipher = Aes256Gcm::new_from_slice(&security.0).map_err(|_| ServiceError::Encryption)?;
+    let aad = envelope_aad(
+        &envelope.schema_id,
+        &envelope.caller_runtime_id,
+        &envelope.request_id,
+        envelope.message_kind,
+    )?;
+    cipher
+        .decrypt(
+            Nonce::from_slice(&envelope.nonce),
+            Payload {
+                msg: &envelope.ciphertext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| ServiceError::Encryption)
+}
+
+fn envelope_aad(
+    schema_id: &str,
+    caller_runtime_id: &str,
+    request_id: &str,
+    message_kind: CodexEnvelopeKind,
+) -> Result<Vec<u8>, ServiceError> {
+    rmp_serde::to_vec(&(schema_id, caller_runtime_id, request_id, message_kind))
+        .map_err(|_| ServiceError::Encoding)
+}
+
+fn validate_envelope(
+    envelope: &CodexTransportEnvelope,
+    expected_kind: CodexEnvelopeKind,
+) -> Result<(), ServiceError> {
+    if envelope.schema_id != ENVELOPE_SCHEMA_ID || envelope.message_kind != expected_kind {
+        return Err(ServiceError::Envelope);
+    }
+    require_id(&envelope.caller_runtime_id, "caller_runtime_id")?;
+    require_id(&envelope.request_id, "request_id")?;
+    if envelope.ciphertext.is_empty() {
+        return Err(ServiceError::Envelope);
+    }
+    Ok(())
+}
+
+pub struct CodexCallerAdmission {
+    caller_runtime_id: String,
+    security: CodexTransportKey,
+    allowed_models: HashSet<String>,
+    max_concurrent_requests: usize,
+    max_payload_bytes: usize,
+    max_output_tokens: u32,
+}
+
+impl CodexCallerAdmission {
+    pub fn new(
+        caller_runtime_id: impl Into<String>,
+        connection_key: impl Into<String>,
+        allowed_models: impl IntoIterator<Item = String>,
+        max_concurrent_requests: usize,
+        max_payload_bytes: usize,
+        max_output_tokens: u32,
+    ) -> Result<Self, ServiceError> {
+        let caller_runtime_id = caller_runtime_id.into();
+        require_id(&caller_runtime_id, "caller_runtime_id")?;
+        let allowed_models = allowed_models.into_iter().collect::<HashSet<_>>();
+        if allowed_models.is_empty()
+            || allowed_models
+                .iter()
+                .any(|model| require_id(model, "allowed_model").is_err())
+            || max_concurrent_requests == 0
+            || max_payload_bytes == 0
+            || max_output_tokens == 0
+        {
+            return Err(ServiceError::InvalidAdmission);
+        }
+        let connection_key = connection_key.into();
+        let security = CodexTransportKey::from_connection_secret(&connection_key)?;
+        Ok(Self {
+            caller_runtime_id,
+            security,
+            allowed_models,
+            max_concurrent_requests,
+            max_payload_bytes,
+            max_output_tokens,
+        })
+    }
+
+    pub fn caller_runtime_id(&self) -> &str {
+        &self.caller_runtime_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RequestIdentity {
+    caller_runtime_id: String,
+    request_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveRequest {
+    invocation_sha256: [u8; 32],
+    expires_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompletedRequest {
+    invocation_sha256: [u8; 32],
+    expires_at_unix_ms: u64,
+    response: CodexTransportEnvelope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexExecutionClaim {
+    invocation: CodexTransportInvocation,
+    invocation_sha256: [u8; 32],
+}
+
+impl CodexExecutionClaim {
+    pub fn invocation(&self) -> &CodexTransportInvocation {
+        &self.invocation
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexTransportAdmission {
+    Execute(Box<CodexExecutionClaim>),
+    Reply(CodexTransportEnvelope),
+}
+
+pub struct CodexTransportService {
+    callers: HashMap<String, CodexCallerAdmission>,
+    active: HashMap<RequestIdentity, ActiveRequest>,
+    completed: HashMap<RequestIdentity, CompletedRequest>,
+    max_expiry_skew_ms: u64,
+}
+
+impl CodexTransportService {
+    pub fn new(
+        admissions: impl IntoIterator<Item = CodexCallerAdmission>,
+        max_expiry_skew_ms: u64,
+    ) -> Result<Self, ServiceError> {
+        if max_expiry_skew_ms == 0 {
+            return Err(ServiceError::InvalidAdmission);
+        }
+        let mut callers = HashMap::new();
+        let mut keys = HashSet::new();
+        for admission in admissions {
+            if !keys.insert(admission.security.0) {
+                return Err(ServiceError::SharedCallerKey);
+            }
+            let caller_runtime_id = admission.caller_runtime_id.clone();
+            if callers.insert(caller_runtime_id, admission).is_some() {
+                return Err(ServiceError::DuplicateCaller);
+            }
+        }
+        if callers.is_empty() {
+            return Err(ServiceError::InvalidAdmission);
+        }
+        Ok(Self {
+            callers,
+            active: HashMap::new(),
+            completed: HashMap::new(),
+            max_expiry_skew_ms,
+        })
+    }
+
+    pub fn begin(
+        &mut self,
+        envelope: &CodexTransportEnvelope,
+        now_unix_ms: u64,
+    ) -> Result<CodexTransportAdmission, ServiceError> {
+        validate_envelope(envelope, CodexEnvelopeKind::Invocation)?;
+        let caller = self
+            .callers
+            .get(&envelope.caller_runtime_id)
+            .ok_or(ServiceError::CallerNotAdmitted)?;
+        if envelope.ciphertext.len() > caller.max_payload_bytes {
+            return Err(ServiceError::PayloadTooLarge);
+        }
+        let security = caller.security.clone();
+        let max_concurrent_requests = caller.max_concurrent_requests;
+        let invocation = decrypt_invocation(envelope, &security)?;
+        if let Err(error) = invocation.validate(now_unix_ms, self.max_expiry_skew_ms) {
+            return self.reply_refusal(&invocation, contract_refusal(&error), &security);
+        }
+        if !caller.allowed_models.contains(&invocation.request.model)
+            || invocation
+                .request
+                .max_output_tokens
+                .is_some_and(|limit| limit > caller.max_output_tokens)
+        {
+            return self.reply_refusal(&invocation, CodexRefusal::Policy, &security);
+        }
+
+        self.active
+            .retain(|_, request| request.expires_at_unix_ms >= now_unix_ms);
+        self.completed
+            .retain(|_, request| request.expires_at_unix_ms >= now_unix_ms);
+
+        let identity = RequestIdentity {
+            caller_runtime_id: invocation.caller_runtime_id.clone(),
+            request_id: invocation.request_id().to_string(),
+        };
+        let invocation_sha256: [u8; 32] =
+            Sha256::digest(canonical_invocation_bytes(&invocation)?).into();
+        if let Some(completed) = self.completed.get(&identity) {
+            return if completed.invocation_sha256 == invocation_sha256 {
+                Ok(CodexTransportAdmission::Reply(completed.response.clone()))
+            } else {
+                self.reply_refusal(&invocation, CodexRefusal::ReplayConflict, &security)
+            };
+        }
+        if let Some(active) = self.active.get(&identity) {
+            let refusal = if active.invocation_sha256 == invocation_sha256 {
+                CodexRefusal::InFlight
+            } else {
+                CodexRefusal::ReplayConflict
+            };
+            return self.reply_refusal(&invocation, refusal, &security);
+        }
+        let active_for_caller = self
+            .active
+            .keys()
+            .filter(|key| key.caller_runtime_id == invocation.caller_runtime_id)
+            .count();
+        if active_for_caller >= max_concurrent_requests {
+            return self.reply_refusal(&invocation, CodexRefusal::Capacity, &security);
+        }
+
+        self.active.insert(
+            identity,
+            ActiveRequest {
+                invocation_sha256,
+                expires_at_unix_ms: invocation.expires_at_unix_ms,
+            },
+        );
+        Ok(CodexTransportAdmission::Execute(Box::new(
+            CodexExecutionClaim {
+                invocation,
+                invocation_sha256,
+            },
+        )))
+    }
+
+    pub fn complete(
+        &mut self,
+        claim: CodexExecutionClaim,
+        result: CodexTransportResult,
+    ) -> Result<CodexTransportEnvelope, ServiceError> {
+        if !matches!(
+            &result.disposition,
+            CodexTransportDisposition::Transported { .. }
+        ) {
+            return Err(ServiceError::InvalidCompletion);
+        }
+        result.validate_against(&claim.invocation)?;
+        let identity = RequestIdentity {
+            caller_runtime_id: claim.invocation.caller_runtime_id.clone(),
+            request_id: claim.invocation.request_id().to_string(),
+        };
+        let active = self
+            .active
+            .get(&identity)
+            .ok_or(ServiceError::NoActiveRequest)?;
+        if active.invocation_sha256 != claim.invocation_sha256 {
+            return Err(ServiceError::ActiveRequestMismatch);
+        }
+        let caller = self
+            .callers
+            .get(&identity.caller_runtime_id)
+            .ok_or(ServiceError::CallerNotAdmitted)?;
+        let response = encrypt_result(&result, &caller.security)?;
+        self.active.remove(&identity);
+        self.completed.insert(
+            identity,
+            CompletedRequest {
+                invocation_sha256: claim.invocation_sha256,
+                expires_at_unix_ms: claim.invocation.expires_at_unix_ms,
+                response: response.clone(),
+            },
+        );
+        Ok(response)
+    }
+
+    pub fn cancel(&mut self, claim: &CodexExecutionClaim) -> bool {
+        let identity = RequestIdentity {
+            caller_runtime_id: claim.invocation.caller_runtime_id.clone(),
+            request_id: claim.invocation.request_id().to_string(),
+        };
+        self.active
+            .get(&identity)
+            .is_some_and(|active| active.invocation_sha256 == claim.invocation_sha256)
+            && self.active.remove(&identity).is_some()
+    }
+
+    fn reply_refusal(
+        &self,
+        invocation: &CodexTransportInvocation,
+        refusal: CodexRefusal,
+        security: &CodexTransportKey,
+    ) -> Result<CodexTransportAdmission, ServiceError> {
+        Ok(CodexTransportAdmission::Reply(encrypt_result(
+            &CodexTransportResult::refused(invocation, refusal),
+            security,
+        )?))
+    }
+}
+
+fn contract_refusal(error: &ContractError) -> CodexRefusal {
+    match error {
+        ContractError::Expiry => CodexRefusal::Expired,
+        ContractError::Identity => CodexRefusal::IdentitySubstitution,
+        ContractError::ProviderDigest => CodexRefusal::ProviderDigestSubstitution,
+        _ => CodexRefusal::Malformed,
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ServiceError {
+    #[error(transparent)]
+    Contract(#[from] ContractError),
+    #[error("invalid caller admission")]
+    InvalidAdmission,
+    #[error("caller runtime was admitted twice")]
+    DuplicateCaller,
+    #[error("callers must not share transport keys")]
+    SharedCallerKey,
+    #[error("caller runtime is not admitted")]
+    CallerNotAdmitted,
+    #[error("transport payload exceeds the caller bound")]
+    PayloadTooLarge,
+    #[error("unexpected transport envelope")]
+    Envelope,
+    #[error("transport envelope identity substitution")]
+    OuterIdentity,
+    #[error("transport encryption or authentication failed")]
+    Encryption,
+    #[error("transport MessagePack encoding failed")]
+    Encoding,
+    #[error("completion did not carry a transported provider outcome")]
+    InvalidCompletion,
+    #[error("completion has no active request")]
+    NoActiveRequest,
+    #[error("completion does not match the active request")]
+    ActiveRequestMismatch,
 }
 
 fn require_id(value: &str, field: &'static str) -> Result<(), ContractError> {
@@ -530,12 +1023,9 @@ mod tests {
     #[test]
     fn transported_result_binds_identity_digest_and_event_order() {
         let invocation = invocation();
-        let result = CodexTransportResult::Transported {
-            schema_id: RESULT_SCHEMA_ID.to_string(),
-            request_id: invocation.request_id().to_string(),
-            caller_runtime_id: invocation.caller_runtime_id.clone(),
-            provider_request_sha256: invocation.provider_request_sha256,
-            events: vec![CodexTransportEvent {
+        let result = CodexTransportResult::transported(
+            &invocation,
+            vec![CodexTransportEvent {
                 sequence: 0,
                 payload: CodexTransportEventPayload::ToolCall {
                     call_id: "call-1".to_string(),
@@ -543,12 +1033,13 @@ mod tests {
                     arguments: "{}".to_string(),
                 },
             }],
-            receipt: receipt(&invocation),
-        };
+            receipt(&invocation),
+        );
         assert_eq!(result.validate_against(&invocation), Ok(()));
 
         let mut reordered = result;
-        let CodexTransportResult::Transported { events, .. } = &mut reordered else {
+        let CodexTransportDisposition::Transported { events, .. } = &mut reordered.disposition
+        else {
             unreachable!()
         };
         events[0].sequence = 1;
@@ -574,5 +1065,212 @@ mod tests {
             substituted_native_basis.validate_against(&invocation),
             Err(ContractError::NativeDigest)
         );
+    }
+
+    fn caller(
+        caller_runtime_id: &str,
+        key: &str,
+        max_concurrent_requests: usize,
+    ) -> CodexCallerAdmission {
+        CodexCallerAdmission::new(
+            caller_runtime_id,
+            key,
+            ["gpt-5.4".to_string()],
+            max_concurrent_requests,
+            64 * 1024,
+            32_768,
+        )
+        .unwrap()
+    }
+
+    fn service(max_concurrent_requests: usize) -> CodexTransportService {
+        CodexTransportService::new(
+            [
+                caller(
+                    "epiphany-yggdrasil",
+                    "epiphany-distinct-test-key",
+                    max_concurrent_requests,
+                ),
+                caller(
+                    "ghostlight-yggdrasil",
+                    "ghostlight-distinct-test-key",
+                    max_concurrent_requests,
+                ),
+            ],
+            5_000,
+        )
+        .unwrap()
+    }
+
+    fn security(key: &str) -> CodexTransportKey {
+        CodexTransportKey::from_connection_secret(key).unwrap()
+    }
+
+    fn invocation_for(caller_runtime_id: &str, request_id: &str) -> CodexTransportInvocation {
+        let mut request = request();
+        request.request_id = request_id.to_string();
+        CodexTransportInvocation::new(caller_runtime_id, 2_000, [7; 32], request).unwrap()
+    }
+
+    #[test]
+    fn encrypted_invocation_hides_content_and_binds_outer_identity() {
+        let invocation = invocation();
+        let epiphany_key = security("epiphany-distinct-test-key");
+        let envelope = encrypt_invocation(&invocation, &epiphany_key).unwrap();
+        assert!(
+            !envelope
+                .ciphertext
+                .windows("Projected state".len())
+                .any(|window| window == b"Projected state")
+        );
+        assert_eq!(
+            decrypt_invocation(&envelope, &epiphany_key).unwrap(),
+            invocation
+        );
+        assert_eq!(
+            decrypt_invocation(&envelope, &security("wrong-caller-key")),
+            Err(ServiceError::Encryption)
+        );
+
+        let mut substituted = envelope;
+        substituted.request_id = "request-2".to_string();
+        assert_eq!(
+            decrypt_invocation(&substituted, &epiphany_key),
+            Err(ServiceError::Encryption)
+        );
+    }
+
+    #[test]
+    fn service_refuses_shared_keys_and_isolates_caller_request_identities() {
+        assert!(matches!(
+            CodexTransportService::new(
+                [
+                    caller("epiphany-yggdrasil", "shared-key", 1),
+                    caller("ghostlight-yggdrasil", "shared-key", 1),
+                ],
+                5_000,
+            ),
+            Err(ServiceError::SharedCallerKey)
+        ));
+
+        let epiphany = invocation_for("epiphany-yggdrasil", "shared-request-id");
+        let ghostlight = invocation_for("ghostlight-yggdrasil", "shared-request-id");
+        let mut service = service(1);
+        assert!(matches!(
+            service
+                .begin(
+                    &encrypt_invocation(&epiphany, &security("epiphany-distinct-test-key"))
+                        .unwrap(),
+                    1_000,
+                )
+                .unwrap(),
+            CodexTransportAdmission::Execute(_)
+        ));
+        assert!(matches!(
+            service
+                .begin(
+                    &encrypt_invocation(&ghostlight, &security("ghostlight-distinct-test-key"))
+                        .unwrap(),
+                    1_000,
+                )
+                .unwrap(),
+            CodexTransportAdmission::Execute(_)
+        ));
+    }
+
+    #[test]
+    fn service_returns_exact_completed_replay_and_refuses_conflicting_replay() {
+        let invocation = invocation();
+        let security = security("epiphany-distinct-test-key");
+        let mut service = service(1);
+        let claim = match service
+            .begin(&encrypt_invocation(&invocation, &security).unwrap(), 1_000)
+            .unwrap()
+        {
+            CodexTransportAdmission::Execute(claim) => claim,
+            CodexTransportAdmission::Reply(_) => panic!("first invocation must execute"),
+        };
+        let response = service
+            .complete(
+                *claim,
+                CodexTransportResult::transported(
+                    &invocation,
+                    vec![CodexTransportEvent {
+                        sequence: 0,
+                        payload: CodexTransportEventPayload::ToolCall {
+                            call_id: "call-1".to_string(),
+                            name: "read_source".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    }],
+                    receipt(&invocation),
+                ),
+            )
+            .unwrap();
+
+        let replay = match service
+            .begin(&encrypt_invocation(&invocation, &security).unwrap(), 1_000)
+            .unwrap()
+        {
+            CodexTransportAdmission::Reply(response) => response,
+            CodexTransportAdmission::Execute(_) => panic!("completed invocation re-executed"),
+        };
+        assert_eq!(replay, response);
+        let decoded = decrypt_result(&replay, &security, &invocation).unwrap();
+        assert!(matches!(
+            decoded.disposition,
+            CodexTransportDisposition::Transported { .. }
+        ));
+
+        let mut changed_request = request();
+        changed_request.instructions.push_str(" Different cargo.");
+        let conflicting =
+            CodexTransportInvocation::new("epiphany-yggdrasil", 2_000, [7; 32], changed_request)
+                .unwrap();
+        let refusal = match service
+            .begin(&encrypt_invocation(&conflicting, &security).unwrap(), 1_000)
+            .unwrap()
+        {
+            CodexTransportAdmission::Reply(response) => response,
+            CodexTransportAdmission::Execute(_) => panic!("conflicting replay executed"),
+        };
+        assert!(matches!(
+            decrypt_result(&refusal, &security, &conflicting)
+                .unwrap()
+                .disposition,
+            CodexTransportDisposition::Refused(CodexRefusal::ReplayConflict)
+        ));
+    }
+
+    #[test]
+    fn service_refuses_duplicate_inflight_and_per_caller_capacity() {
+        let first = invocation_for("epiphany-yggdrasil", "request-1");
+        let second = invocation_for("epiphany-yggdrasil", "request-2");
+        let security = security("epiphany-distinct-test-key");
+        let mut service = service(1);
+        let first_envelope = encrypt_invocation(&first, &security).unwrap();
+        assert!(matches!(
+            service.begin(&first_envelope, 1_000).unwrap(),
+            CodexTransportAdmission::Execute(_)
+        ));
+
+        for (invocation, expected) in [
+            (&first, CodexRefusal::InFlight),
+            (&second, CodexRefusal::Capacity),
+        ] {
+            let response = match service
+                .begin(&encrypt_invocation(invocation, &security).unwrap(), 1_000)
+                .unwrap()
+            {
+                CodexTransportAdmission::Reply(response) => response,
+                CodexTransportAdmission::Execute(_) => panic!("refused invocation executed"),
+            };
+            assert_eq!(
+                decrypt_result(&response, &security, invocation)
+                    .unwrap()
+                    .disposition,
+                CodexTransportDisposition::Refused(expected)
+            );
+        }
     }
 }
