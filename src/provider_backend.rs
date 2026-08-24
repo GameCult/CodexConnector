@@ -114,13 +114,17 @@ impl CodexProviderBackend {
         &self,
         invocation: &CodexTransportInvocation,
     ) -> Result<CodexTransportResult, CodexProviderBackendError> {
-        let (first, user_agent) = {
+        let (first, user_agent, client_version) = {
             let mut authority = self
                 .authority
                 .lock()
                 .map_err(|_| CodexProviderBackendError::CredentialAuthorityPoisoned)?;
             let credential = authority.read_credential(false)?;
-            (credential, authority.app_server_user_agent.clone())
+            (
+                credential,
+                authority.app_server_user_agent.clone(),
+                authority.codex_cli_version.clone(),
+            )
         };
         let body = provider_http_body(&invocation.request, first.mode)?;
         let first_digest = first.auth_file_sha256;
@@ -131,12 +135,13 @@ impl CodexProviderBackend {
             &body,
             &first,
             &user_agent,
+            &client_version,
         );
         let response = match response {
             Ok(response)
                 if response.status().as_u16() == 401 && first.mode == CodexAuthMode::Chatgpt =>
             {
-                let (refreshed, user_agent) = {
+                let (refreshed, user_agent, client_version) = {
                     let mut authority = self
                         .authority
                         .lock()
@@ -147,7 +152,11 @@ impl CodexProviderBackend {
                     } else {
                         authority.read_credential(true)?
                     };
-                    (credential, authority.app_server_user_agent.clone())
+                    (
+                        credential,
+                        authority.app_server_user_agent.clone(),
+                        authority.codex_cli_version.clone(),
+                    )
                 };
                 if refreshed.auth_file_sha256 == first_digest {
                     return Ok(failed_result(
@@ -164,6 +173,7 @@ impl CodexProviderBackend {
                     &refreshed_body,
                     &refreshed,
                     &user_agent,
+                    &client_version,
                 )
             }
             result => result,
@@ -271,6 +281,7 @@ fn send_provider_request(
     body: &[u8],
     credential: &CodexCredentialSnapshot,
     user_agent: &str,
+    client_version: &str,
 ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
     let authorization = Zeroizing::new(format!("Bearer {}", credential.bearer.as_str()));
     let mut request = http
@@ -282,7 +293,7 @@ fn send_provider_request(
         .header("user-agent", user_agent)
         .header("session_id", &invocation.request.conversation_id)
         .header("x-client-request-id", invocation.request_id())
-        .header("version", env!("CARGO_PKG_VERSION"));
+        .header("version", client_version);
     if let Some(account_id) = &credential.account_id {
         request = request.header("ChatGPT-Account-ID", account_id);
     }
@@ -562,6 +573,7 @@ struct CodexAppServerAuthority {
     rpc: AppServerRpc<BufReader<ChildStdout>, ChildStdin>,
     codex_home: PathBuf,
     app_server_user_agent: String,
+    codex_cli_version: String,
 }
 
 impl CodexAppServerAuthority {
@@ -625,11 +637,19 @@ impl CodexAppServerAuthority {
             return Err(CodexProviderBackendError::CodexHomeIdentity);
         }
 
+        let codex_cli_version = match codex_cli_version_from_user_agent(&initialized.user_agent) {
+            Ok(version) => version,
+            Err(error) => {
+                terminate_child(&mut child);
+                return Err(error);
+            }
+        };
         Ok(Self {
             child,
             rpc,
             codex_home: expected_home,
             app_server_user_agent: initialized.user_agent,
+            codex_cli_version,
         })
     }
 
@@ -642,6 +662,27 @@ impl CodexAppServerAuthority {
             .map_err(CodexProviderBackendError::AuthFile)?;
         parse_auth_file(&auth_bytes, account)
     }
+}
+
+fn codex_cli_version_from_user_agent(
+    user_agent: &str,
+) -> Result<String, CodexProviderBackendError> {
+    let prefix = format!("{CONNECTOR_ORIGINATOR}/");
+    let first = user_agent
+        .split_whitespace()
+        .next()
+        .ok_or(CodexProviderBackendError::AppServerVersionIdentity)?;
+    let version = first
+        .strip_prefix(&prefix)
+        .ok_or(CodexProviderBackendError::AppServerVersionIdentity)?;
+    if version.is_empty()
+        || !version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+    {
+        return Err(CodexProviderBackendError::AppServerVersionIdentity);
+    }
+    Ok(version.to_string())
 }
 
 impl Drop for CodexAppServerAuthority {
@@ -962,6 +1003,8 @@ pub enum CodexProviderBackendError {
     CodexHomeIdentity,
     #[error("Codex app-server protocol failed")]
     AppServerProtocol,
+    #[error("Codex app-server did not report its pinned CLI version")]
+    AppServerVersionIdentity,
     #[error("Codex app-server IO failed")]
     AppServerIo(#[source] io::Error),
     #[error("Codex app-server refused the authentication request")]
@@ -1031,6 +1074,29 @@ mod tests {
             let text = message.to_string();
             !text.contains("prompt") && !text.contains("tool") && !text.contains("model")
         }));
+    }
+
+    #[test]
+    fn provider_version_comes_from_the_pinned_codex_app_server_identity() {
+        assert_eq!(
+            codex_cli_version_from_user_agent(
+                "gamecult_codex_connector/0.150.0-alpha.7 (Debian 13.0.0; x86_64) unknown (gamecult_codex_connector; 0.1.0)"
+            )
+            .unwrap(),
+            "0.150.0-alpha.7"
+        );
+        assert!(matches!(
+            codex_cli_version_from_user_agent("codex_cli_rs/0.150.0-alpha.7"),
+            Err(CodexProviderBackendError::AppServerVersionIdentity)
+        ));
+        assert!(matches!(
+            codex_cli_version_from_user_agent("gamecult_codex_connector/0.150.0 bad version"),
+            Ok(version) if version == "0.150.0"
+        ));
+        assert!(matches!(
+            codex_cli_version_from_user_agent("gamecult_codex_connector/not/a/version"),
+            Err(CodexProviderBackendError::AppServerVersionIdentity)
+        ));
     }
 
     #[test]
@@ -1223,6 +1289,7 @@ mod tests {
             &expected_body,
             &credential,
             "codex/test",
+            "0.150.0-alpha.7",
         )
         .unwrap();
         let parsed = parse_responses_sse(response.into_body().into_reader()).unwrap();
@@ -1244,6 +1311,8 @@ mod tests {
         assert!(headers.contains("originator: gamecult_codex_connector"));
         assert!(headers.contains("session_id: conversation-http"));
         assert!(headers.contains("x-client-request-id: request-http"));
+        assert!(headers.contains("version: 0.150.0-alpha.7"));
+        assert!(!headers.contains(concat!("version: ", env!("CARGO_PKG_VERSION"))));
         assert_eq!(&received[headers_end + 4..], expected_body);
     }
 
