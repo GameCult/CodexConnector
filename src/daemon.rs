@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,6 +15,7 @@ use zeroize::Zeroizing;
 use crate::{
     CodexAppServerConfig, CodexCallerAdmission, CodexProviderBackend, CodexProviderBackendError,
     CodexTransportAdmission, CodexTransportEnvelope, CodexTransportService, ServiceError,
+    TransportFrameError, read_transport_frame, write_transport_frame,
 };
 
 const CONFIG_EPOCH: u32 = 2;
@@ -236,7 +236,7 @@ fn serve_connection(
         .set_read_timeout(Some(timeout))
         .and_then(|()| stream.set_write_timeout(Some(timeout)))
         .map_err(CodexDaemonError::Connection)?;
-    let request = read_frame(&mut stream, max_frame_bytes)?;
+    let request = read_transport_frame(&mut stream, max_frame_bytes).map_err(frame_error)?;
     let envelope: CodexTransportEnvelope =
         rmp_serde::from_slice(&request).map_err(|_| CodexDaemonError::FrameEncoding)?;
     let admission = service
@@ -254,38 +254,14 @@ fn serve_connection(
         }
     };
     let response = rmp_serde::to_vec(&response).map_err(|_| CodexDaemonError::FrameEncoding)?;
-    write_frame(&mut stream, &response, max_frame_bytes)
+    write_transport_frame(&mut stream, &response, max_frame_bytes).map_err(frame_error)
 }
 
-fn read_frame(reader: &mut impl Read, max_frame_bytes: usize) -> Result<Vec<u8>, CodexDaemonError> {
-    let mut length = [0_u8; 4];
-    reader
-        .read_exact(&mut length)
-        .map_err(CodexDaemonError::Connection)?;
-    let length = u32::from_be_bytes(length) as usize;
-    if length == 0 || length > max_frame_bytes {
-        return Err(CodexDaemonError::FrameSize);
+fn frame_error(error: TransportFrameError) -> CodexDaemonError {
+    match error {
+        TransportFrameError::Connection(error) => CodexDaemonError::Connection(error),
+        TransportFrameError::Size => CodexDaemonError::FrameSize,
     }
-    let mut payload = vec![0_u8; length];
-    reader
-        .read_exact(&mut payload)
-        .map_err(CodexDaemonError::Connection)?;
-    Ok(payload)
-}
-
-fn write_frame(
-    writer: &mut impl Write,
-    payload: &[u8],
-    max_frame_bytes: usize,
-) -> Result<(), CodexDaemonError> {
-    if payload.is_empty() || payload.len() > max_frame_bytes || payload.len() > u32::MAX as usize {
-        return Err(CodexDaemonError::FrameSize);
-    }
-    writer
-        .write_all(&(payload.len() as u32).to_be_bytes())
-        .and_then(|()| writer.write_all(payload))
-        .and_then(|()| writer.flush())
-        .map_err(CodexDaemonError::Connection)
 }
 
 fn unix_ms() -> Result<u64, CodexDaemonError> {
@@ -414,14 +390,17 @@ mod tests {
     #[test]
     fn direct_pipe_frame_is_big_endian_and_refuses_oversize_before_allocation() {
         let mut encoded = Vec::new();
-        write_frame(&mut encoded, b"typed", 16).unwrap();
+        write_transport_frame(&mut encoded, b"typed", 16).unwrap();
         assert_eq!(&encoded[..4], &5_u32.to_be_bytes());
-        assert_eq!(read_frame(&mut Cursor::new(encoded), 16).unwrap(), b"typed");
+        assert_eq!(
+            read_transport_frame(&mut Cursor::new(encoded), 16).unwrap(),
+            b"typed"
+        );
 
         let oversized = 17_u32.to_be_bytes().to_vec();
         assert!(matches!(
-            read_frame(&mut Cursor::new(oversized), 16),
-            Err(CodexDaemonError::FrameSize)
+            read_transport_frame(&mut Cursor::new(oversized), 16),
+            Err(TransportFrameError::Size)
         ));
     }
 }

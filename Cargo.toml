@@ -14,16 +14,21 @@ path = "src/lib.rs"
 [[bin]]
 name = "codex-connector"
 path = "src/main.rs"
+required-features = ["daemon"]
+
+[features]
+default = []
+daemon = ["dep:cultcache-rs", "dep:ureq"]
 
 [dependencies]
 aes-gcm = "0.10"
 base64 = "0.23"
-cultcache-rs = { git = "https://github.com/GameCult/cultcache-rs.git", rev = "fdbf3bf0a4b3f6b617c224d7439feb8e69d4474c" }
+cultcache-rs = { git = "https://github.com/GameCult/cultcache-rs.git", rev = "fdbf3bf0a4b3f6b617c224d7439feb8e69d4474c", optional = true }
 rand_core = { version = "0.6", features = ["getrandom"] }
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
-ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+ureq = { version = "3.4", default-features = false, features = ["rustls"], optional = true }
 zeroize = "1"

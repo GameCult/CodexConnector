@@ -12,9 +12,15 @@ one credential store. The public connector reads the credential only after the
 child's private auth RPC completes, then performs the exact Responses request.
 It owns no prompt policy or decision authority.
 
-The current source establishes the v2 typed contract, its transport-neutral
-service core, the private Codex-auth/provider backend, and one public daemon
-entrypoint. The daemon reads one typed CultCache configuration document, binds
+The default library is the shared consumer ABI: v2 typed contracts, exact
+provider lowering, encryption, bounded direct-pipe framing, one-request socket
+transport, and exact result validation. It does not compile CultCache, HTTP,
+TLS, provider auth, replay, or daemon code. Epiphany and Ghostlight consume this
+surface instead of copying wire law.
+
+The explicit `daemon` feature adds the transport service core, private
+Codex-auth/provider backend, and the sole public daemon entrypoint. The daemon
+reads one typed CultCache configuration document, binds
 only loopback, uses CultNet's four-byte big-endian direct-pipe framing around
 the encrypted MessagePack envelope, bounds connection threads and frame sizes,
 and keeps provider execution outside the service-state lock. One keyed
@@ -35,6 +41,14 @@ SSE into typed text, tool-call, usage, and failure receipts.
 No upstream Codex crate is linked into the package. The official binary is a
 pinned deployment input, keeping Codex's application build graph outside both
 consumers and this small daemon.
+
+Focused verification uses the two real build surfaces:
+
+```text
+cargo test --lib
+cargo test --lib --features daemon
+cargo check --bin codex-connector --features daemon
+```
 
 This is not yet a deployable replacement for the live connector. Redacted
 CultMesh/Odin publication, shared consumer client cuts, and the independent

@@ -1,28 +1,49 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::time::Duration;
+
+#[cfg(feature = "daemon")]
+use std::collections::HashMap;
+#[cfg(feature = "daemon")]
 use std::path::Path;
 
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+#[cfg(feature = "daemon")]
 use cultcache_rs::{CultCache, DatabaseEntry, OwnedRedbMessagePackBackingStore};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(feature = "daemon")]
 mod daemon;
+#[cfg(feature = "daemon")]
 mod provider_backend;
 
+#[cfg(feature = "daemon")]
 pub use daemon::CodexCallerConfig;
+#[cfg(feature = "daemon")]
 pub use daemon::CodexDaemonConfig;
+#[cfg(feature = "daemon")]
 pub use daemon::CodexDaemonError;
+#[cfg(feature = "daemon")]
 pub use daemon::load_daemon_config;
+#[cfg(feature = "daemon")]
 pub use daemon::serve;
+#[cfg(feature = "daemon")]
 pub use daemon::write_daemon_config;
+#[cfg(feature = "daemon")]
 pub use provider_backend::CodexAppServerConfig;
+#[cfg(feature = "daemon")]
 pub use provider_backend::CodexAuthMode;
+#[cfg(feature = "daemon")]
 pub use provider_backend::CodexAuthReadiness;
+#[cfg(feature = "daemon")]
 pub use provider_backend::CodexProviderBackend;
+#[cfg(feature = "daemon")]
 pub use provider_backend::CodexProviderBackendError;
 
 pub const PROVIDER_REQUEST_SCHEMA_ID: &str = "gamecult.codex.provider_request.v2";
@@ -40,6 +61,12 @@ impl CodexTransportKey {
             return Err(ServiceError::InvalidAdmission);
         }
         Ok(Self(Sha256::digest(secret.as_bytes()).into()))
+    }
+}
+
+impl Drop for CodexTransportKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 
@@ -678,6 +705,121 @@ pub fn decrypt_result(
     Ok(result)
 }
 
+#[derive(Clone)]
+pub struct CodexConnectorClient {
+    endpoint: SocketAddr,
+    security: CodexTransportKey,
+    max_frame_bytes: usize,
+    timeout: Duration,
+}
+
+impl CodexConnectorClient {
+    pub fn new(
+        endpoint: SocketAddr,
+        connection_key: impl Into<String>,
+        max_frame_bytes: usize,
+        timeout: Duration,
+    ) -> Result<Self, CodexConnectorClientError> {
+        if !endpoint.ip().is_loopback()
+            || endpoint.port() == 0
+            || !(4096..=u32::MAX as usize).contains(&max_frame_bytes)
+            || timeout.is_zero()
+        {
+            return Err(CodexConnectorClientError::InvalidConfig);
+        }
+        let connection_key = Zeroizing::new(connection_key.into());
+        let security = CodexTransportKey::from_connection_secret(connection_key.as_str())?;
+        Ok(Self {
+            endpoint,
+            security,
+            max_frame_bytes,
+            timeout,
+        })
+    }
+
+    pub fn execute(
+        &self,
+        invocation: &CodexTransportInvocation,
+    ) -> Result<CodexTransportResult, CodexConnectorClientError> {
+        let request = rmp_serde::to_vec(&encrypt_invocation(invocation, &self.security)?)
+            .map_err(|_| CodexConnectorClientError::Encoding)?;
+        let mut stream = TcpStream::connect_timeout(&self.endpoint, self.timeout)
+            .map_err(CodexConnectorClientError::Connection)?;
+        stream
+            .set_read_timeout(Some(self.timeout))
+            .and_then(|()| stream.set_write_timeout(Some(self.timeout)))
+            .map_err(CodexConnectorClientError::Connection)?;
+        write_transport_frame(&mut stream, &request, self.max_frame_bytes)
+            .map_err(client_frame_error)?;
+        let response =
+            read_transport_frame(&mut stream, self.max_frame_bytes).map_err(client_frame_error)?;
+        let envelope =
+            rmp_serde::from_slice(&response).map_err(|_| CodexConnectorClientError::Encoding)?;
+        decrypt_result(&envelope, &self.security, invocation).map_err(Into::into)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum CodexConnectorClientError {
+    #[error("invalid connector client configuration")]
+    InvalidConfig,
+    #[error("connector client connection failed")]
+    Connection(#[source] std::io::Error),
+    #[error("connector frame exceeded its bound")]
+    FrameSize,
+    #[error("connector MessagePack encoding failed")]
+    Encoding,
+    #[error(transparent)]
+    Transport(#[from] ServiceError),
+}
+
+#[derive(Debug)]
+enum TransportFrameError {
+    Connection(std::io::Error),
+    Size,
+}
+
+fn client_frame_error(error: TransportFrameError) -> CodexConnectorClientError {
+    match error {
+        TransportFrameError::Connection(error) => CodexConnectorClientError::Connection(error),
+        TransportFrameError::Size => CodexConnectorClientError::FrameSize,
+    }
+}
+
+fn read_transport_frame(
+    reader: &mut impl Read,
+    max_frame_bytes: usize,
+) -> Result<Vec<u8>, TransportFrameError> {
+    let mut length = [0_u8; 4];
+    reader
+        .read_exact(&mut length)
+        .map_err(TransportFrameError::Connection)?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length == 0 || length > max_frame_bytes {
+        return Err(TransportFrameError::Size);
+    }
+    let mut payload = vec![0_u8; length];
+    reader
+        .read_exact(&mut payload)
+        .map_err(TransportFrameError::Connection)?;
+    Ok(payload)
+}
+
+fn write_transport_frame(
+    writer: &mut impl Write,
+    payload: &[u8],
+    max_frame_bytes: usize,
+) -> Result<(), TransportFrameError> {
+    if payload.is_empty() || payload.len() > max_frame_bytes || payload.len() > u32::MAX as usize {
+        return Err(TransportFrameError::Size);
+    }
+    writer
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .and_then(|()| writer.write_all(payload))
+        .and_then(|()| writer.flush())
+        .map_err(TransportFrameError::Connection)
+}
+
 fn encrypt_message(
     caller_runtime_id: &str,
     request_id: &str,
@@ -762,6 +904,7 @@ fn validate_envelope(
     Ok(())
 }
 
+#[cfg(feature = "daemon")]
 pub struct CodexCallerAdmission {
     caller_runtime_id: String,
     connection_key_epoch: u32,
@@ -772,6 +915,7 @@ pub struct CodexCallerAdmission {
     max_output_tokens: u32,
 }
 
+#[cfg(feature = "daemon")]
 impl CodexCallerAdmission {
     pub fn new(
         caller_runtime_id: impl Into<String>,
@@ -814,18 +958,21 @@ impl CodexCallerAdmission {
     }
 }
 
+#[cfg(feature = "daemon")]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RequestIdentity {
     caller_runtime_id: String,
     request_id: String,
 }
 
+#[cfg(feature = "daemon")]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum CodexReplayState {
     Active,
     Completed { response: CodexTransportEnvelope },
 }
 
+#[cfg(feature = "daemon")]
 #[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
 #[cultcache(type = "gamecult.codex.replay_record.v1")]
 struct CodexReplayRecord {
@@ -843,24 +990,28 @@ struct CodexReplayRecord {
     state: CodexReplayState,
 }
 
+#[cfg(feature = "daemon")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexExecutionClaim {
     invocation: CodexTransportInvocation,
     invocation_sha256: [u8; 32],
 }
 
+#[cfg(feature = "daemon")]
 impl CodexExecutionClaim {
     pub fn invocation(&self) -> &CodexTransportInvocation {
         &self.invocation
     }
 }
 
+#[cfg(feature = "daemon")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodexTransportAdmission {
     Execute(Box<CodexExecutionClaim>),
     Reply(CodexTransportEnvelope),
 }
 
+#[cfg(feature = "daemon")]
 pub struct CodexTransportService {
     callers: HashMap<String, CodexCallerAdmission>,
     live: HashSet<RequestIdentity>,
@@ -868,6 +1019,7 @@ pub struct CodexTransportService {
     max_expiry_skew_ms: u64,
 }
 
+#[cfg(feature = "daemon")]
 impl CodexTransportService {
     pub fn open(
         replay_store_path: &Path,
@@ -1081,6 +1233,7 @@ impl CodexTransportService {
     }
 }
 
+#[cfg(feature = "daemon")]
 fn replay_key(identity: &RequestIdentity) -> String {
     let mut hasher = Sha256::new();
     hasher.update((identity.caller_runtime_id.len() as u64).to_be_bytes());
@@ -1097,10 +1250,12 @@ fn replay_key(identity: &RequestIdentity) -> String {
     key
 }
 
+#[cfg(feature = "daemon")]
 fn replay_store_error(error: impl std::fmt::Display) -> ServiceError {
     ServiceError::ReplayStore(error.to_string())
 }
 
+#[cfg(feature = "daemon")]
 fn contract_refusal(error: &ContractError) -> CodexRefusal {
     match error {
         ContractError::Expiry => CodexRefusal::Expired,
@@ -1214,15 +1369,19 @@ pub enum ContractError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "daemon")]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[cfg(feature = "daemon")]
     static TEST_STORE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
+    #[cfg(feature = "daemon")]
     struct TestStore {
         root: std::path::PathBuf,
         path: std::path::PathBuf,
     }
 
+    #[cfg(feature = "daemon")]
     impl TestStore {
         fn new() -> Self {
             let sequence = TEST_STORE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -1236,6 +1395,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "daemon")]
     impl Drop for TestStore {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
@@ -1433,6 +1593,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "daemon")]
     fn caller(
         caller_runtime_id: &str,
         key: &str,
@@ -1450,6 +1611,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(feature = "daemon")]
     fn open_service(store: &TestStore, max_concurrent_requests: usize) -> CodexTransportService {
         CodexTransportService::open(
             &store.path,
@@ -1474,6 +1636,7 @@ mod tests {
         CodexTransportKey::from_connection_secret(key).unwrap()
     }
 
+    #[cfg(feature = "daemon")]
     fn invocation_for(caller_runtime_id: &str, request_id: &str) -> CodexTransportInvocation {
         let mut request = request();
         request.request_id = request_id.to_string();
@@ -1509,6 +1672,46 @@ mod tests {
     }
 
     #[test]
+    fn shared_client_transports_one_exact_encrypted_request_and_result() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let invocation = invocation();
+        let expected = invocation.clone();
+        let security = security("epiphany-distinct-test-key");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_transport_frame(&mut stream, 64 * 1024).unwrap();
+            let envelope: CodexTransportEnvelope = rmp_serde::from_slice(&request).unwrap();
+            assert_eq!(decrypt_invocation(&envelope, &security).unwrap(), expected);
+            let response = encrypt_result(
+                &CodexTransportResult::refused(&expected, CodexRefusal::Policy),
+                &security,
+            )
+            .unwrap();
+            write_transport_frame(
+                &mut stream,
+                &rmp_serde::to_vec(&response).unwrap(),
+                64 * 1024,
+            )
+            .unwrap();
+        });
+
+        let client = CodexConnectorClient::new(
+            endpoint,
+            "epiphany-distinct-test-key",
+            64 * 1024,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(
+            client.execute(&invocation).unwrap().disposition,
+            CodexTransportDisposition::Refused(CodexRefusal::Policy)
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "daemon")]
     fn service_refuses_shared_keys_and_isolates_caller_request_identities() {
         let store = TestStore::new();
         assert!(matches!(
@@ -1549,6 +1752,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "daemon")]
     fn service_returns_exact_completed_replay_and_refuses_conflicting_replay() {
         let store = TestStore::new();
         let invocation = invocation();
@@ -1616,6 +1820,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "daemon")]
     fn service_refuses_duplicate_inflight_and_per_caller_capacity() {
         let store = TestStore::new();
         let first = invocation_for("epiphany-yggdrasil", "request-1");
@@ -1649,6 +1854,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "daemon")]
     fn restart_refuses_ambiguous_claim_without_consuming_live_capacity() {
         let store = TestStore::new();
         let first = invocation_for("epiphany-yggdrasil", "request-1");
