@@ -18,6 +18,9 @@ transport, and exact result validation. It does not compile CultCache, HTTP,
 TLS, provider auth, replay, or daemon code. Epiphany and Ghostlight consume this
 surface instead of copying wire law.
 
+Connection establishment is bounded independently. Response read/write timeout
+is optional so a consumer's typed outer pass may remain the sole deadline owner.
+
 The explicit `daemon` feature adds the transport service core, private
 Codex-auth/provider backend, and the sole public daemon entrypoint. The daemon
 reads one typed CultCache configuration document, binds

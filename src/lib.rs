@@ -710,7 +710,7 @@ pub struct CodexConnectorClient {
     endpoint: SocketAddr,
     security: CodexTransportKey,
     max_frame_bytes: usize,
-    timeout: Duration,
+    response_timeout: Option<Duration>,
 }
 
 impl CodexConnectorClient {
@@ -718,12 +718,12 @@ impl CodexConnectorClient {
         endpoint: SocketAddr,
         connection_key: impl Into<String>,
         max_frame_bytes: usize,
-        timeout: Duration,
+        response_timeout: Option<Duration>,
     ) -> Result<Self, CodexConnectorClientError> {
         if !endpoint.ip().is_loopback()
             || endpoint.port() == 0
             || !(4096..=u32::MAX as usize).contains(&max_frame_bytes)
-            || timeout.is_zero()
+            || response_timeout.is_some_and(|timeout| timeout.is_zero())
         {
             return Err(CodexConnectorClientError::InvalidConfig);
         }
@@ -733,7 +733,7 @@ impl CodexConnectorClient {
             endpoint,
             security,
             max_frame_bytes,
-            timeout,
+            response_timeout,
         })
     }
 
@@ -743,11 +743,15 @@ impl CodexConnectorClient {
     ) -> Result<CodexTransportResult, CodexConnectorClientError> {
         let request = rmp_serde::to_vec(&encrypt_invocation(invocation, &self.security)?)
             .map_err(|_| CodexConnectorClientError::Encoding)?;
-        let mut stream = TcpStream::connect_timeout(&self.endpoint, self.timeout)
+        let connect_timeout = self
+            .response_timeout
+            .unwrap_or(Duration::from_secs(10))
+            .min(Duration::from_secs(10));
+        let mut stream = TcpStream::connect_timeout(&self.endpoint, connect_timeout)
             .map_err(CodexConnectorClientError::Connection)?;
         stream
-            .set_read_timeout(Some(self.timeout))
-            .and_then(|()| stream.set_write_timeout(Some(self.timeout)))
+            .set_read_timeout(self.response_timeout)
+            .and_then(|()| stream.set_write_timeout(self.response_timeout))
             .map_err(CodexConnectorClientError::Connection)?;
         write_transport_frame(&mut stream, &request, self.max_frame_bytes)
             .map_err(client_frame_error)?;
@@ -1700,7 +1704,7 @@ mod tests {
             endpoint,
             "epiphany-distinct-test-key",
             64 * 1024,
-            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
         )
         .unwrap();
         assert_eq!(
