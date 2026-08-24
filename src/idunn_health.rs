@@ -180,6 +180,11 @@ impl ProviderHealthPublisher {
 }
 
 pub fn enroll_provider_health_identity(path: &Path) -> Result<String> {
+    let binding = machine_binding()?;
+    enroll_provider_health_identity_with_binding(path, &binding)
+}
+
+fn enroll_provider_health_identity_with_binding(path: &Path, binding: &str) -> Result<String> {
     if path.exists() {
         bail!("provider health identity already exists");
     }
@@ -194,14 +199,13 @@ pub fn enroll_provider_health_identity(path: &Path) -> Result<String> {
     let public_key = key.verifying_key().to_bytes();
     let mut nonce = [0_u8; 32];
     OsRng.fill_bytes(&mut nonce);
-    let binding = machine_binding()?;
     let entry = ProviderHealthIdentity {
         schema_version: IDENTITY_SCHEMA.into(),
         identity_id: identity_id(&public_key),
         public_key: public_key.to_vec(),
-        protected_private_seed: mask_seed(&seed, &binding),
+        protected_private_seed: mask_seed(&seed, binding),
         protector_kind: "linux_file_mode_machine_id_binding".into(),
-        protector_binding: binding,
+        protector_binding: binding.into(),
         protector_version: "v1".into(),
         assurance: "os_installation_file_bound_cloneable_baseline".into(),
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -223,7 +227,9 @@ pub fn enroll_provider_health_identity(path: &Path) -> Result<String> {
         return Err(error.into());
     }
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    provider_health_public_key_hex(path)
+    Ok(hex(&open_identity_with_binding(path, binding)?
+        .entry
+        .public_key))
 }
 
 pub fn provider_health_public_key_hex(path: &Path) -> Result<String> {
@@ -231,6 +237,11 @@ pub fn provider_health_public_key_hex(path: &Path) -> Result<String> {
 }
 
 fn open_identity(path: &Path) -> Result<ProviderHealthSigner> {
+    let binding = machine_binding()?;
+    open_identity_with_binding(path, &binding)
+}
+
+fn open_identity_with_binding(path: &Path, binding: &str) -> Result<ProviderHealthSigner> {
     let entries = SingleFileMessagePackBackingStore::new(path).pull_all()?;
     let [envelope] = entries.as_slice() else {
         bail!("provider health identity store must contain exactly one record");
@@ -243,11 +254,10 @@ fn open_identity(path: &Path) -> Result<ProviderHealthSigner> {
     }
     let entry: ProviderHealthIdentity = rmp_serde::from_slice(&envelope.payload)?;
     validate_identity(&entry)?;
-    let binding = machine_binding()?;
     if entry.protector_binding != binding {
         bail!("provider health identity belongs to another machine");
     }
-    let seed: [u8; 32] = mask_seed(&entry.protected_private_seed, &binding)
+    let seed: [u8; 32] = mask_seed(&entry.protected_private_seed, binding)
         .try_into()
         .map_err(|_| anyhow!("provider health identity seed has invalid length"))?;
     let key = SigningKey::from_bytes(&seed);
@@ -408,9 +418,16 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("identity.cc");
-        let public_key = enroll_provider_health_identity(&path).unwrap();
-        assert_eq!(provider_health_public_key_hex(&path).unwrap(), public_key);
-        let signer = open_identity(&path).unwrap();
+        let binding = "fixture-machine-binding";
+        let public_key = enroll_provider_health_identity_with_binding(&path, binding).unwrap();
+        assert_eq!(
+            hex(&open_identity_with_binding(&path, binding)
+                .unwrap()
+                .entry
+                .public_key),
+            public_key
+        );
+        let signer = open_identity_with_binding(&path, binding).unwrap();
         let mut record = SignedDaemonHealth {
             schema_version: HEALTH_SCHEMA.into(),
             daemon_id: "yggdrasil-codex-connector".into(),
