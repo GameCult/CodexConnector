@@ -25,6 +25,8 @@ use crate::canonical_responses_body;
 
 const MAX_APP_SERVER_LINE_BYTES: usize = 1024 * 1024;
 const MAX_INTERLEAVED_MESSAGES: usize = 64;
+const MAX_PROVIDER_ERROR_BYTES: usize = 4 * 1024;
+const MAX_PROVIDER_ERROR_CHARS: usize = 512;
 const MAX_SSE_FRAME_BYTES: usize = 2 * 1024 * 1024;
 const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
 const OPENAI_RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
@@ -73,6 +75,7 @@ impl CodexProviderBackend {
             .timeout_recv_response(Some(Duration::from_secs(30)))
             .timeout_recv_body(Some(Duration::from_secs(300)))
             .max_redirects(0)
+            .http_status_as_error(false)
             .build()
             .into();
         Ok(Self {
@@ -121,15 +124,18 @@ impl CodexProviderBackend {
         };
         let body = provider_http_body(&invocation.request, first.mode)?;
         let first_digest = first.auth_file_sha256;
-        let response = match send_provider_request(
+        let response = send_provider_request(
             &self.http,
             provider_url(first.mode),
             invocation,
             &body,
             &first,
             &user_agent,
-        ) {
-            Err(ureq::Error::StatusCode(401)) if first.mode == CodexAuthMode::Chatgpt => {
+        );
+        let response = match response {
+            Ok(response)
+                if response.status().as_u16() == 401 && first.mode == CodexAuthMode::Chatgpt =>
+            {
                 let (refreshed, user_agent) = {
                     let mut authority = self
                         .authority
@@ -164,13 +170,6 @@ impl CodexProviderBackend {
         };
         let response = match response {
             Ok(response) => response,
-            Err(ureq::Error::StatusCode(status)) => {
-                return Ok(failed_result(
-                    invocation,
-                    "provider_http_status",
-                    &format!("provider returned HTTP {status}"),
-                ));
-            }
             Err(_) => {
                 return Ok(failed_result(
                     invocation,
@@ -179,6 +178,14 @@ impl CodexProviderBackend {
                 ));
             }
         };
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let detail = provider_error_detail(response.into_body().into_reader());
+            let message = detail
+                .map(|detail| format!("provider returned HTTP {status}: {detail}"))
+                .unwrap_or_else(|| format!("provider returned HTTP {status}"));
+            return Ok(failed_result(invocation, "provider_http_status", &message));
+        }
         let parsed = match parse_responses_sse(response.into_body().into_reader()) {
             Ok(parsed) => parsed,
             Err(message) => return Ok(failed_result(invocation, "provider_stream", message)),
@@ -206,6 +213,30 @@ impl CodexProviderBackend {
         }
         Ok(result)
     }
+}
+
+fn provider_error_detail(mut reader: impl Read) -> Option<String> {
+    let mut bytes = Vec::new();
+    reader
+        .by_ref()
+        .take((MAX_PROVIDER_ERROR_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.is_empty() || bytes.len() > MAX_PROVIDER_ERROR_BYTES {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    let message = value
+        .pointer("/error/message")
+        .or_else(|| value.get("detail"))
+        .or_else(|| value.get("message"))
+        .and_then(Value::as_str)?;
+    let detail = message
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_PROVIDER_ERROR_CHARS)
+        .collect::<String>();
+    (!detail.trim().is_empty()).then_some(detail)
 }
 
 fn provider_http_body(
@@ -1248,6 +1279,29 @@ mod tests {
         assert_eq!(
             crate::provider_request_sha256(&request).unwrap(),
             request_digest
+        );
+    }
+
+    #[test]
+    fn provider_error_detail_keeps_only_one_bounded_structured_message() {
+        let body = br#"{
+            "error": {
+                "message": "Unsupported parameter: prompt_cache_key.\nRemove it.",
+                "request_echo": "private projected context"
+            }
+        }"#;
+        assert_eq!(
+            provider_error_detail(io::Cursor::new(body)),
+            Some("Unsupported parameter: prompt_cache_key.Remove it.".to_string())
+        );
+    }
+
+    #[test]
+    fn provider_error_detail_refuses_unstructured_or_oversized_bodies() {
+        assert_eq!(provider_error_detail(io::Cursor::new(b"not json")), None);
+        assert_eq!(
+            provider_error_detail(io::Cursor::new(vec![b'x'; MAX_PROVIDER_ERROR_BYTES + 1])),
+            None
         );
     }
 }
