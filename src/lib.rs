@@ -727,8 +727,10 @@ impl CodexConnectorClient {
         max_frame_bytes: usize,
         response_timeout: Option<Duration>,
     ) -> Result<Self, CodexConnectorClientError> {
-        if !endpoint.ip().is_loopback()
-            || endpoint.port() == 0
+        if endpoint.port() == 0
+            || endpoint.ip().is_unspecified()
+            || endpoint.ip().is_multicast()
+            || endpoint.ip() == std::net::Ipv4Addr::BROADCAST
             || !(4096..=u32::MAX as usize).contains(&max_frame_bytes)
             || response_timeout.is_some_and(|timeout| timeout.is_zero())
         {
@@ -767,6 +769,45 @@ impl CodexConnectorClient {
         let envelope =
             rmp_serde::from_slice(&response).map_err(|_| CodexConnectorClientError::Encoding)?;
         decrypt_result(&envelope, &self.security, invocation).map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod client_endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn client_admits_explicit_unicast_and_refuses_non_destinations() {
+        for endpoint in ["127.0.0.1:4103", "172.19.0.1:4103", "[::1]:4103"] {
+            assert!(
+                CodexConnectorClient::new(
+                    endpoint.parse().unwrap(),
+                    "bounded-client-endpoint-key",
+                    64 * 1024,
+                    Some(Duration::from_secs(1)),
+                )
+                .is_ok(),
+                "{endpoint} should be an admissible explicit destination"
+            );
+        }
+        for endpoint in [
+            "0.0.0.0:4103",
+            "255.255.255.255:4103",
+            "224.0.0.1:4103",
+            "[::]:4103",
+            "[ff02::1]:4103",
+            "127.0.0.1:0",
+        ] {
+            assert!(matches!(
+                CodexConnectorClient::new(
+                    endpoint.parse().unwrap(),
+                    "bounded-client-endpoint-key",
+                    64 * 1024,
+                    Some(Duration::from_secs(1)),
+                ),
+                Err(CodexConnectorClientError::InvalidConfig)
+            ));
+        }
     }
 }
 
