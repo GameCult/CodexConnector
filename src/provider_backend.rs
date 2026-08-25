@@ -500,7 +500,7 @@ fn parse_responses_sse(reader: impl Read) -> Result<ParsedProviderStream, &'stat
             .by_ref()
             .take((MAX_SSE_FRAME_BYTES + 1) as u64)
             .read_until(b'\n', &mut line)
-            .map_err(|error| provider_sse_read_error(error.kind()))?;
+            .map_err(|error| provider_sse_read_error(&error))?;
         if read == 0 {
             if !data.is_empty() {
                 state.accept_frame(&data)?;
@@ -544,7 +544,24 @@ fn parse_responses_sse(reader: impl Read) -> Result<ParsedProviderStream, &'stat
     })
 }
 
-fn provider_sse_read_error(kind: io::ErrorKind) -> &'static str {
+fn provider_sse_read_error(error: &io::Error) -> &'static str {
+    if let Some(ureq_error) = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<ureq::Error>())
+    {
+        return match ureq_error {
+            ureq::Error::Timeout(_) => "provider SSE read timed out",
+            ureq::Error::Protocol(_) => "provider SSE protocol failed",
+            ureq::Error::Tls(_) | ureq::Error::Rustls(_) => "provider SSE secure transport failed",
+            ureq::Error::BodyStalled => "provider SSE body stalled",
+            ureq::Error::Io(inner) => provider_sse_io_error(inner.kind()),
+            _ => "provider SSE read failed",
+        };
+    }
+    provider_sse_io_error(error.kind())
+}
+
+fn provider_sse_io_error(kind: io::ErrorKind) -> &'static str {
     match kind {
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => "provider SSE read timed out",
         io::ErrorKind::ConnectionReset
@@ -1057,6 +1074,14 @@ mod tests {
         }
     }
 
+    struct WrappedFailingReader(Option<ureq::Error>);
+
+    impl Read for WrappedFailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other(self.0.take().unwrap()))
+        }
+    }
+
     fn jwt(payload: Value) -> String {
         let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
         format!("e30.{payload}.signature")
@@ -1256,6 +1281,10 @@ mod tests {
         assert_eq!(
             parse_responses_sse(FailingReader(io::ErrorKind::Other)).err(),
             Some("provider SSE read failed")
+        );
+        assert_eq!(
+            parse_responses_sse(WrappedFailingReader(Some(ureq::Error::BodyStalled))).err(),
+            Some("provider SSE body stalled")
         );
     }
 
