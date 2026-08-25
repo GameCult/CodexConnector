@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use codex_connector::{CodexCallerConfig, CodexDaemonConfig};
 
-const USAGE: &str = "usage:\n  codex-connector --config PATH.cc\n  codex-connector --initialize-single-caller-config PATH.cc BIND CODEX_EXECUTABLE CODEX_SHA256 CODEX_HOME REPLAY_STORE CALLER_RUNTIME_ID CONNECTION_KEY_FILE CONNECTION_KEY_EPOCH ALLOWED_MODEL MAX_CONCURRENT_REQUESTS MAX_PAYLOAD_BYTES MAX_OUTPUT_TOKENS\n  codex-connector --enroll-provider-health-identity PATH.cc\n  codex-connector --provider-health-public-key PATH.cc";
+const USAGE: &str = "usage:\n  codex-connector --config PATH.cc\n  codex-connector --initialize-single-caller-config PATH.cc BIND CODEX_EXECUTABLE CODEX_SHA256 CODEX_HOME REPLAY_STORE CALLER_RUNTIME_ID CONNECTION_KEY_FILE CONNECTION_KEY_EPOCH ALLOWED_MODEL MAX_CONCURRENT_REQUESTS MAX_PAYLOAD_BYTES MAX_OUTPUT_TOKENS\n  codex-connector --admit-caller-config SOURCE.cc DESTINATION.cc CALLER_RUNTIME_ID CONNECTION_KEY_FILE CONNECTION_KEY_EPOCH ALLOWED_MODEL MAX_CONCURRENT_REQUESTS MAX_PAYLOAD_BYTES MAX_OUTPUT_TOKENS\n  codex-connector --enroll-provider-health-identity PATH.cc\n  codex-connector --provider-health-public-key PATH.cc";
 
 fn main() {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
@@ -41,6 +41,16 @@ fn main() {
         }
         return;
     }
+    if args
+        .first()
+        .is_some_and(|value| value == "--admit-caller-config")
+    {
+        if let Err(error) = admit_caller_config(&args[1..]) {
+            eprintln!("codex-connector caller admission failed: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
     let config = match args.as_slice() {
         [flag, path] if flag == "--config" => PathBuf::from(path),
         _ => {
@@ -52,6 +62,51 @@ fn main() {
         eprintln!("codex-connector stopped: {error}");
         std::process::exit(1);
     }
+}
+
+fn admit_caller_config(args: &[OsString]) -> Result<(), String> {
+    let [
+        source,
+        destination,
+        caller_runtime_id,
+        connection_key_file,
+        connection_key_epoch,
+        allowed_model,
+        max_concurrent_requests,
+        max_payload_bytes,
+        max_output_tokens,
+    ] = args
+    else {
+        return Err("expected exactly nine caller-admission values".to_string());
+    };
+    let mut config = codex_connector::load_daemon_config(&PathBuf::from(source))
+        .map_err(|error| error.to_string())?;
+    let caller_runtime_id = os_text(caller_runtime_id, "caller runtime")?;
+    if config
+        .callers
+        .iter()
+        .any(|caller| caller.caller_runtime_id == caller_runtime_id)
+    {
+        return Err(format!("caller {caller_runtime_id} is already admitted"));
+    }
+    let caller = CodexCallerConfig {
+        caller_runtime_id,
+        connection_key_file: PathBuf::from(connection_key_file),
+        connection_key_epoch: parse_number(connection_key_epoch, "connection key epoch")?,
+        allowed_models: vec![os_text(allowed_model, "allowed model")?],
+        max_concurrent_requests: parse_number(max_concurrent_requests, "max concurrent requests")?,
+        max_payload_bytes: parse_number(max_payload_bytes, "max payload bytes")?,
+        max_output_tokens: parse_number(max_output_tokens, "max output tokens")?,
+    };
+    config.max_frame_bytes = config
+        .max_frame_bytes
+        .max(caller.max_payload_bytes.saturating_add(4096));
+    config.max_connections = config
+        .max_connections
+        .max(caller.max_concurrent_requests.max(8));
+    config.callers.push(caller);
+    codex_connector::write_daemon_config(&PathBuf::from(destination), &config)
+        .map_err(|error| error.to_string())
 }
 
 fn initialize_single_caller_config(args: &[OsString]) -> Result<(), String> {
