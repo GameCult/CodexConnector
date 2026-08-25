@@ -72,7 +72,11 @@ impl CodexProviderBackend {
         let max_result_bytes = config.max_result_bytes;
         let http: ureq::Agent = ureq::Agent::config_builder()
             .timeout_connect(Some(Duration::from_secs(30)))
-            .timeout_recv_response(Some(Duration::from_secs(30)))
+            // ureq carries the receive-response deadline into streamed body
+            // reads as a preceding phase. Keep both receive phases on the
+            // same provider window so a 30-second header bound cannot silently
+            // cap a valid long-running SSE response.
+            .timeout_recv_response(Some(Duration::from_secs(300)))
             .timeout_recv_body(Some(Duration::from_secs(300)))
             .max_redirects(0)
             .http_status_as_error(false)
