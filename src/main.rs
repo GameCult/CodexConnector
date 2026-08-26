@@ -82,13 +82,6 @@ fn admit_caller_config(args: &[OsString]) -> Result<(), String> {
     let mut config = codex_connector::load_daemon_config(&PathBuf::from(source))
         .map_err(|error| error.to_string())?;
     let caller_runtime_id = os_text(caller_runtime_id, "caller runtime")?;
-    if config
-        .callers
-        .iter()
-        .any(|caller| caller.caller_runtime_id == caller_runtime_id)
-    {
-        return Err(format!("caller {caller_runtime_id} is already admitted"));
-    }
     let caller = CodexCallerConfig {
         caller_runtime_id,
         connection_key_file: PathBuf::from(connection_key_file),
@@ -98,13 +91,9 @@ fn admit_caller_config(args: &[OsString]) -> Result<(), String> {
         max_payload_bytes: parse_number(max_payload_bytes, "max payload bytes")?,
         max_output_tokens: parse_number(max_output_tokens, "max output tokens")?,
     };
-    config.max_frame_bytes = config
-        .max_frame_bytes
-        .max(caller.max_payload_bytes.saturating_add(4096));
-    config.max_connections = config
-        .max_connections
-        .max(caller.max_concurrent_requests.max(8));
-    config.callers.push(caller);
+    config
+        .admit_caller(caller)
+        .map_err(|error| error.to_string())?;
     codex_connector::write_daemon_config(&PathBuf::from(destination), &config)
         .map_err(|error| error.to_string())
 }

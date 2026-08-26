@@ -110,6 +110,10 @@ impl CodexDaemonConfig {
         {
             return Err(CodexDaemonError::InvalidConfig("runtime bounds"));
         }
+        let required_connections = required_connection_capacity(&self.callers)?;
+        if self.max_connections < required_connections {
+            return Err(CodexDaemonError::InvalidConfig("connection capacity"));
+        }
         let mut caller_ids = HashSet::new();
         for caller in &self.callers {
             if caller.caller_runtime_id.trim().is_empty()
@@ -132,6 +136,37 @@ impl CodexDaemonConfig {
         }
         Ok(bind)
     }
+
+    pub fn admit_caller(&mut self, caller: CodexCallerConfig) -> Result<(), CodexDaemonError> {
+        let mut candidate = self.clone();
+        if candidate
+            .callers
+            .iter()
+            .any(|existing| existing.caller_runtime_id == caller.caller_runtime_id)
+        {
+            return Err(CodexDaemonError::InvalidConfig("duplicate caller"));
+        }
+        candidate.max_frame_bytes = candidate.max_frame_bytes.max(
+            caller
+                .max_payload_bytes
+                .saturating_add(FRAME_OVERHEAD_BUDGET),
+        );
+        candidate.callers.push(caller);
+        candidate.max_connections = required_connection_capacity(&candidate.callers)?;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+}
+
+fn required_connection_capacity(callers: &[CodexCallerConfig]) -> Result<usize, CodexDaemonError> {
+    callers
+        .iter()
+        .try_fold(0_usize, |total, caller| {
+            total.checked_add(caller.max_concurrent_requests)
+        })
+        .map(|total| total.max(8))
+        .ok_or(CodexDaemonError::InvalidConfig("connection capacity"))
 }
 
 pub fn load_daemon_config(path: &Path) -> Result<CodexDaemonConfig, CodexDaemonError> {
@@ -492,6 +527,48 @@ mod tests {
         assert_eq!(config.max_connections, 12);
         assert_eq!(config.callers, vec![caller]);
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn caller_admission_reserves_every_independently_admitted_request_slot() {
+        let root = Path::new("/srv/codex-connector");
+        let first = CodexCallerConfig {
+            caller_runtime_id: "ghostlight-dungeon-yggdrasil".to_string(),
+            connection_key_file: root.join("ghostlight.key"),
+            connection_key_epoch: 1,
+            allowed_models: vec!["gpt-5.6-luna".to_string()],
+            max_concurrent_requests: 8,
+            max_payload_bytes: 1_048_576,
+            max_output_tokens: 16_384,
+        };
+        let mut config = CodexDaemonConfig::single_caller(
+            "127.0.0.1:4103",
+            root.join("codex"),
+            [7; 32],
+            root.join("codex-home"),
+            root.join("replay.cc"),
+            first,
+        );
+        config
+            .admit_caller(CodexCallerConfig {
+                caller_runtime_id: "epiphany-model-runtime".to_string(),
+                connection_key_file: root.join("epiphany.key"),
+                connection_key_epoch: 1,
+                allowed_models: vec!["gpt-5.6-luna".to_string()],
+                max_concurrent_requests: 8,
+                max_payload_bytes: 1_048_576,
+                max_output_tokens: 16_384,
+            })
+            .unwrap();
+
+        assert_eq!(config.max_connections, 16);
+        config.validate().unwrap();
+
+        config.max_connections = 15;
+        assert!(matches!(
+            config.validate(),
+            Err(CodexDaemonError::InvalidConfig("connection capacity"))
+        ));
     }
 
     #[test]
