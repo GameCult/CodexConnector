@@ -116,16 +116,18 @@ impl CodexDaemonConfig {
         }
         let mut caller_ids = HashSet::new();
         for caller in &self.callers {
+            let mut allowed_models = HashSet::new();
             if caller.caller_runtime_id.trim().is_empty()
                 || caller.caller_runtime_id.trim() != caller.caller_runtime_id
                 || !caller_ids.insert(caller.caller_runtime_id.as_str())
                 || caller.connection_key_file.as_os_str().is_empty()
                 || caller.connection_key_epoch == 0
                 || caller.allowed_models.is_empty()
-                || caller
-                    .allowed_models
-                    .iter()
-                    .any(|model| model.trim().is_empty() || model.trim() != model)
+                || caller.allowed_models.iter().any(|model| {
+                    model.trim().is_empty()
+                        || model.trim() != model
+                        || !allowed_models.insert(model.as_str())
+                })
                 || caller.max_concurrent_requests == 0
                 || caller.max_payload_bytes < 4096
                 || caller.max_payload_bytes > self.max_frame_bytes - FRAME_OVERHEAD_BUDGET
@@ -527,6 +529,23 @@ mod tests {
         assert_eq!(config.max_connections, 12);
         assert_eq!(config.callers, vec![caller]);
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn typed_config_preserves_a_unique_multi_model_caller_allowlist() {
+        let root = Path::new("/srv/codex-connector");
+        let mut config = config(root);
+        config.callers[0].allowed_models =
+            vec!["gpt-5.6-luna".to_string(), "gpt-5.6-terra".to_string()];
+        config.validate().unwrap();
+
+        config.callers[0]
+            .allowed_models
+            .push("gpt-5.6-luna".to_string());
+        assert!(matches!(
+            config.validate(),
+            Err(CodexDaemonError::InvalidConfig("caller admission"))
+        ));
     }
 
     #[test]

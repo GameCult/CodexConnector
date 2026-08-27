@@ -1,9 +1,10 @@
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
 use codex_connector::{CodexCallerConfig, CodexDaemonConfig};
 
-const USAGE: &str = "usage:\n  codex-connector --config PATH.cc\n  codex-connector --initialize-single-caller-config PATH.cc BIND CODEX_EXECUTABLE CODEX_SHA256 CODEX_HOME REPLAY_STORE CALLER_RUNTIME_ID CONNECTION_KEY_FILE CONNECTION_KEY_EPOCH ALLOWED_MODEL MAX_CONCURRENT_REQUESTS MAX_PAYLOAD_BYTES MAX_OUTPUT_TOKENS\n  codex-connector --admit-caller-config SOURCE.cc DESTINATION.cc CALLER_RUNTIME_ID CONNECTION_KEY_FILE CONNECTION_KEY_EPOCH ALLOWED_MODEL MAX_CONCURRENT_REQUESTS MAX_PAYLOAD_BYTES MAX_OUTPUT_TOKENS\n  codex-connector --enroll-provider-health-identity PATH.cc\n  codex-connector --provider-health-public-key PATH.cc";
+const USAGE: &str = "usage:\n  codex-connector --config PATH.cc\n  codex-connector --initialize-single-caller-config PATH.cc BIND CODEX_EXECUTABLE CODEX_SHA256 CODEX_HOME REPLAY_STORE CALLER_RUNTIME_ID CONNECTION_KEY_FILE CONNECTION_KEY_EPOCH ALLOWED_MODELS_CSV MAX_CONCURRENT_REQUESTS MAX_PAYLOAD_BYTES MAX_OUTPUT_TOKENS\n  codex-connector --admit-caller-config SOURCE.cc DESTINATION.cc CALLER_RUNTIME_ID CONNECTION_KEY_FILE CONNECTION_KEY_EPOCH ALLOWED_MODELS_CSV MAX_CONCURRENT_REQUESTS MAX_PAYLOAD_BYTES MAX_OUTPUT_TOKENS\n  codex-connector --enroll-provider-health-identity PATH.cc\n  codex-connector --provider-health-public-key PATH.cc";
 
 fn main() {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
@@ -71,7 +72,7 @@ fn admit_caller_config(args: &[OsString]) -> Result<(), String> {
         caller_runtime_id,
         connection_key_file,
         connection_key_epoch,
-        allowed_model,
+        allowed_models,
         max_concurrent_requests,
         max_payload_bytes,
         max_output_tokens,
@@ -86,7 +87,7 @@ fn admit_caller_config(args: &[OsString]) -> Result<(), String> {
         caller_runtime_id,
         connection_key_file: PathBuf::from(connection_key_file),
         connection_key_epoch: parse_number(connection_key_epoch, "connection key epoch")?,
-        allowed_models: vec![os_text(allowed_model, "allowed model")?],
+        allowed_models: parse_allowed_models(allowed_models)?,
         max_concurrent_requests: parse_number(max_concurrent_requests, "max concurrent requests")?,
         max_payload_bytes: parse_number(max_payload_bytes, "max payload bytes")?,
         max_output_tokens: parse_number(max_output_tokens, "max output tokens")?,
@@ -109,7 +110,7 @@ fn initialize_single_caller_config(args: &[OsString]) -> Result<(), String> {
         caller_runtime_id,
         connection_key_file,
         connection_key_epoch,
-        allowed_model,
+        allowed_models,
         max_concurrent_requests,
         max_payload_bytes,
         max_output_tokens,
@@ -127,7 +128,7 @@ fn initialize_single_caller_config(args: &[OsString]) -> Result<(), String> {
             caller_runtime_id: os_text(caller_runtime_id, "caller runtime")?,
             connection_key_file: PathBuf::from(connection_key_file),
             connection_key_epoch: parse_number(connection_key_epoch, "connection key epoch")?,
-            allowed_models: vec![os_text(allowed_model, "allowed model")?],
+            allowed_models: parse_allowed_models(allowed_models)?,
             max_concurrent_requests: parse_number(
                 max_concurrent_requests,
                 "max concurrent requests",
@@ -148,6 +149,19 @@ fn os_text(value: &OsString, field: &str) -> Result<String, String> {
         .ok_or_else(|| format!("{field} must be non-empty UTF-8"))
 }
 
+fn parse_allowed_models(value: &OsString) -> Result<Vec<String>, String> {
+    let raw = os_text(value, "allowed models")?;
+    let mut seen = HashSet::new();
+    let mut models = Vec::new();
+    for model in raw.split(',') {
+        if model.is_empty() || model.trim() != model || !seen.insert(model) {
+            return Err("allowed models must be unique non-empty comma-separated IDs".to_string());
+        }
+        models.push(model.to_string());
+    }
+    Ok(models)
+}
+
 fn parse_number<T>(value: &OsString, field: &str) -> Result<T, String>
 where
     T: std::str::FromStr,
@@ -155,6 +169,27 @@ where
     os_text(value, field)?
         .parse()
         .map_err(|_| format!("{field} is not a valid integer"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_allowed_models;
+    use std::ffi::OsString;
+
+    #[test]
+    fn model_allowlist_parser_preserves_one_or_many_exact_models() {
+        assert_eq!(
+            parse_allowed_models(&OsString::from("gpt-5.6-luna")).unwrap(),
+            vec!["gpt-5.6-luna"]
+        );
+        assert_eq!(
+            parse_allowed_models(&OsString::from("gpt-5.6-luna,gpt-5.6-terra")).unwrap(),
+            vec!["gpt-5.6-luna", "gpt-5.6-terra"]
+        );
+        assert!(parse_allowed_models(&OsString::from("gpt-5.6-luna,")).is_err());
+        assert!(parse_allowed_models(&OsString::from("gpt-5.6-luna, gpt-5.6-terra")).is_err());
+        assert!(parse_allowed_models(&OsString::from("gpt-5.6-luna,gpt-5.6-luna")).is_err());
+    }
 }
 
 fn parse_sha256(value: &OsString) -> Result<[u8; 32], String> {
