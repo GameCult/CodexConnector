@@ -37,11 +37,6 @@ pub use daemon::load_daemon_config;
 pub use daemon::serve;
 #[cfg(feature = "daemon")]
 pub use daemon::write_daemon_config;
-#[cfg(all(feature = "daemon", target_os = "linux"))]
-pub use idunn_health::{
-    CODEX_CONNECTOR_IDUNN_HEALTH_CONTRACT, ProviderHealthPublisher,
-    enroll_provider_health_identity, provider_health_public_key_hex,
-};
 #[cfg(feature = "daemon")]
 pub use provider_backend::CodexAppServerConfig;
 #[cfg(feature = "daemon")]

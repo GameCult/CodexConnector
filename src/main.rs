@@ -4,33 +4,10 @@ use std::path::PathBuf;
 
 use codex_connector::{CodexCallerConfig, CodexDaemonConfig};
 
-const USAGE: &str = "usage:\n  codex-connector --config PATH.cc\n  codex-connector --initialize-single-caller-config PATH.cc BIND CODEX_EXECUTABLE CODEX_SHA256 CODEX_HOME REPLAY_STORE CALLER_RUNTIME_ID CONNECTION_KEY_FILE CONNECTION_KEY_EPOCH ALLOWED_MODELS_CSV MAX_CONCURRENT_REQUESTS MAX_PAYLOAD_BYTES MAX_OUTPUT_TOKENS\n  codex-connector --admit-caller-config SOURCE.cc DESTINATION.cc CALLER_RUNTIME_ID CONNECTION_KEY_FILE CONNECTION_KEY_EPOCH ALLOWED_MODELS_CSV MAX_CONCURRENT_REQUESTS MAX_PAYLOAD_BYTES MAX_OUTPUT_TOKENS\n  codex-connector --enroll-provider-health-identity PATH.cc\n  codex-connector --provider-health-public-key PATH.cc";
+const USAGE: &str = "usage:\n  codex-connector --config PATH.cc\n  codex-connector --initialize-single-caller-config PATH.cc BIND CODEX_EXECUTABLE CODEX_SHA256 CODEX_HOME REPLAY_STORE CALLER_RUNTIME_ID CONNECTION_KEY_FILE CONNECTION_KEY_EPOCH ALLOWED_MODELS_CSV MAX_CONCURRENT_REQUESTS MAX_PAYLOAD_BYTES MAX_OUTPUT_TOKENS\n  codex-connector --admit-caller-config SOURCE.cc DESTINATION.cc CALLER_RUNTIME_ID CONNECTION_KEY_FILE CONNECTION_KEY_EPOCH ALLOWED_MODELS_CSV MAX_CONCURRENT_REQUESTS MAX_PAYLOAD_BYTES MAX_OUTPUT_TOKENS";
 
 fn main() {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
-    #[cfg(target_os = "linux")]
-    if let [flag, path] = args.as_slice() {
-        if flag == "--enroll-provider-health-identity" {
-            match codex_connector::enroll_provider_health_identity(&PathBuf::from(path)) {
-                Ok(public_key) => println!("{public_key}"),
-                Err(error) => {
-                    eprintln!("codex-connector health identity enrollment failed: {error}");
-                    std::process::exit(2);
-                }
-            }
-            return;
-        }
-        if flag == "--provider-health-public-key" {
-            match codex_connector::provider_health_public_key_hex(&PathBuf::from(path)) {
-                Ok(public_key) => println!("{public_key}"),
-                Err(error) => {
-                    eprintln!("codex-connector health identity read failed: {error}");
-                    std::process::exit(2);
-                }
-            }
-            return;
-        }
-    }
     if args
         .first()
         .is_some_and(|value| value == "--initialize-single-caller-config")

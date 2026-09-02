@@ -55,10 +55,32 @@ cargo check --bin codex-connector --features daemon
 
 The same production binary can initialize a typed single-caller `.cc`
 configuration for first deployment, then serve only from that admitted state.
-The daemon publishes private-free signed health to Idunn from its own runtime
-identity. Its source revision also owns the exact Codex Linux package and
-binary hashes in `deployment/codex-linux-x64.manifest`, so changing the provider
-toolchain necessarily changes the connector release selected by Idunn.
+On Linux, serving requires Idunn. The daemon publishes one private-free signed
+`warming / traffic-admission-pending` statement, then waits for Idunn's exact
+root-owned typed traffic grant before it launches the provider child, opens
+replay state, or binds a socket.
+The grant also binds the root-observed systemd process ID and Linux process
+start time, so another process with the same service identity cannot consume
+it. The connector revalidates the grant before binding, after a complete
+transport frame has decoded and immediately before service admission, and while
+idle. That successful request check transfers one command to Connector-owned
+execution; later revocation stops later commands but does not rewrite the
+admitted result. The connector has read-only access to the grant and its
+shared-snapshot lock and cannot create, repair, or replace either file.
+
+The health signing identity is created by Idunn's generic provisioning
+authority. CodexConnector can use that identity to sign health but cannot enroll
+it or export its public key. Signed health is derived from the active release:
+the root-owned runtime activation request, the immutable adjacent `DEPLOYMENT`
+witness, the compiled source commit, and the observed hashes of both the running
+connector and configured Codex binary must agree exactly. Initial health setup
+and the probation publication are startup requirements. Later periodic health
+publication is observational and does not acquire traffic authority. The source
+revision owns the exact Codex Linux package and binary hashes in
+`deployment/codex-linux-x64.manifest`; that manifest is compiled into the daemon
+and must agree with the immutable release witness. Activation timestamps live
+in Idunn's mutable deployment receipt. Changing the provider toolchain
+necessarily changes the connector release selected by Idunn.
 
 ## Contract invariant
 

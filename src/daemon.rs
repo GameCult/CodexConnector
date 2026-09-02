@@ -7,8 +7,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "linux")]
+use std::time::Instant;
+
 use cultcache_rs::{CultCache, DatabaseEntry, SingleFileMessagePackBackingStore};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -187,6 +191,33 @@ pub fn load_daemon_config(path: &Path) -> Result<CodexDaemonConfig, CodexDaemonE
     Ok(config)
 }
 
+fn load_daemon_config_snapshot(
+    path: &Path,
+) -> Result<(CodexDaemonConfig, Vec<u8>), CodexDaemonError> {
+    let store = SingleFileMessagePackBackingStore::new(path);
+    let (config, snapshot) = store
+        .with_read_only_shared_snapshot(|entries| {
+            let [envelope] = entries.as_slice() else {
+                anyhow::bail!("connector configuration must contain exactly one record");
+            };
+            if envelope.key != CONFIG_KEY
+                || envelope.r#type != CodexDaemonConfig::TYPE
+                || envelope.schema_id.as_deref() != Some(CodexDaemonConfig::TYPE)
+            {
+                anyhow::bail!("connector configuration has the wrong typed envelope");
+            }
+            let config: CodexDaemonConfig = rmp_serde::from_slice(&envelope.payload)?;
+            if rmp_serde::to_vec(&config)? != envelope.payload {
+                anyhow::bail!("connector configuration is not canonical positional MessagePack");
+            }
+            let snapshot = fs::read(path)?;
+            Ok((config, snapshot))
+        })
+        .map_err(config_store_error)?;
+    config.validate()?;
+    Ok((config, snapshot))
+}
+
 pub fn write_daemon_config(
     path: &Path,
     config: &CodexDaemonConfig,
@@ -205,13 +236,16 @@ pub fn write_daemon_config(
 }
 
 pub fn serve(config_path: &Path) -> Result<(), CodexDaemonError> {
-    let config = load_daemon_config(config_path)?;
+    let (config, config_bytes) = load_daemon_config_snapshot(config_path)?;
     let bind = config.validate()?;
-    let service = Arc::new(Mutex::new(CodexTransportService::open(
-        &config.replay_store,
-        load_admissions(&config)?,
-        config.max_expiry_skew_ms,
-    )?));
+    let (admissions, caller_key_bindings) = load_admissions(&config)?;
+    #[cfg(target_os = "linux")]
+    let (traffic_admission, prepared_health_publisher) =
+        start_idunn_health_publisher(config_path, &config_bytes, &config, &caller_key_bindings)?;
+
+    // Probation performs only immutable activation verification and its one
+    // signed warming publication. Provider process, replay, and socket
+    // actuation begin only after Idunn grants that exact startup statement.
     let backend = Arc::new(CodexProviderBackend::start(CodexAppServerConfig {
         executable: config.codex_executable.clone(),
         executable_sha256: config.codex_executable_sha256,
@@ -219,22 +253,55 @@ pub fn serve(config_path: &Path) -> Result<(), CodexDaemonError> {
         max_result_bytes: config.max_frame_bytes - FRAME_OVERHEAD_BUDGET,
     })?);
     let readiness = backend.readiness()?;
+    let service = Arc::new(Mutex::new(CodexTransportService::open(
+        &config.replay_store,
+        admissions,
+        config.max_expiry_skew_ms,
+    )?));
+    #[cfg(target_os = "linux")]
+    traffic_admission
+        .require_current()
+        .map_err(CodexDaemonError::Health)?;
     let listener = TcpListener::bind(bind).map_err(CodexDaemonError::Listen)?;
+    #[cfg(target_os = "linux")]
+    listener
+        .set_nonblocking(true)
+        .map_err(CodexDaemonError::Listen)?;
+    #[cfg(target_os = "linux")]
+    start_periodic_idunn_health_publisher(prepared_health_publisher, backend.clone())?;
     let active_connections = Arc::new(AtomicUsize::new(0));
+    #[cfg(target_os = "linux")]
+    let mut next_traffic_admission_check = Instant::now();
     eprintln!(
         "codex-connector ready at {} for {} callers using {:?}",
         listener.local_addr().map_err(CodexDaemonError::Listen)?,
         config.callers.len(),
         readiness.auth_mode
     );
-    #[cfg(target_os = "linux")]
-    start_idunn_health_publisher()?;
 
-    for accepted in listener.incoming() {
-        let stream = match accepted {
-            Ok(stream) => stream,
+    loop {
+        #[cfg(target_os = "linux")]
+        if Instant::now() >= next_traffic_admission_check {
+            traffic_admission
+                .require_current()
+                .map_err(CodexDaemonError::Health)?;
+            next_traffic_admission_check = Instant::now() + Duration::from_millis(100);
+        }
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
             Err(error) => return Err(CodexDaemonError::Listen(error)),
         };
+        #[cfg(target_os = "linux")]
+        // The polling check terminates an idle process after revocation. This
+        // second check is the traffic commit point: an accepted socket receives
+        // no request worker under a stale grant.
+        traffic_admission
+            .require_current()
+            .map_err(CodexDaemonError::Health)?;
         if !stream
             .peer_addr()
             .map_err(CodexDaemonError::Connection)?
@@ -250,55 +317,120 @@ pub fn serve(config_path: &Path) -> Result<(), CodexDaemonError> {
         };
         let service = service.clone();
         let backend = backend.clone();
+        #[cfg(target_os = "linux")]
+        let request_traffic_admission = traffic_admission.clone();
         let max_frame_bytes = config.max_frame_bytes;
         let timeout = Duration::from_millis(config.socket_timeout_ms);
         thread::Builder::new()
             .name("codex-connector-request".to_string())
             .spawn(move || {
                 let _permit = permit;
-                let _ = serve_connection(stream, &service, &backend, max_frame_bytes, timeout);
+                let _ = serve_connection(
+                    stream,
+                    &service,
+                    &backend,
+                    #[cfg(target_os = "linux")]
+                    &request_traffic_admission,
+                    max_frame_bytes,
+                    timeout,
+                );
             })
             .map_err(CodexDaemonError::Thread)?;
     }
-    Err(CodexDaemonError::ListenerClosed)
 }
 
 #[cfg(target_os = "linux")]
-fn start_idunn_health_publisher() -> Result<(), CodexDaemonError> {
-    let Some(endpoint) = std::env::var_os("CODEX_CONNECTOR_IDUNN_RUDP") else {
-        return Ok(());
-    };
-    let endpoint = endpoint
-        .to_string_lossy()
+fn start_idunn_health_publisher(
+    config_path: &Path,
+    config_bytes: &[u8],
+    config: &CodexDaemonConfig,
+    caller_key_bindings: &[LoadedCallerKeyBinding],
+) -> Result<
+    (
+        crate::idunn_health::ConnectorTrafficAdmissionGate,
+        crate::idunn_health::ProviderHealthPublisher,
+    ),
+    CodexDaemonError,
+> {
+    let endpoint = required_environment("CODEX_CONNECTOR_IDUNN_RUDP")?
         .parse::<SocketAddr>()
         .map_err(|_| CodexDaemonError::InvalidConfig("Idunn health endpoint"))?;
     let daemon_id = required_environment("CODEX_CONNECTOR_IDUNN_DAEMON")?;
     let runtime_id = required_environment("CODEX_CONNECTOR_RUNTIME_ID")?;
     let contract = std::env::var("CODEX_CONNECTOR_IDUNN_HEALTH_CONTRACT")
-        .unwrap_or_else(|_| crate::CODEX_CONNECTOR_IDUNN_HEALTH_CONTRACT.to_string());
+        .unwrap_or_else(|_| crate::idunn_health::CODEX_CONNECTOR_IDUNN_HEALTH_CONTRACT.to_string());
     let identity = PathBuf::from(required_environment(
         "CODEX_CONNECTOR_IDUNN_HEALTH_IDENTITY",
     )?);
-    let mut publisher =
-        crate::ProviderHealthPublisher::open(endpoint, daemon_id, runtime_id, contract, &identity)
-            .map_err(CodexDaemonError::Health)?;
-    publisher
-        .publish("active", "credential-isolated-transport-ready")
+    let release = crate::idunn_health::active_release_binding(
+        &config.codex_executable,
+        &config.codex_executable_sha256,
+    )
+    .map_err(CodexDaemonError::Health)?;
+    let activation = crate::idunn_health::active_activation_binding(
+        config_path,
+        config_bytes,
+        config,
+        caller_key_bindings,
+    )
+    .map_err(CodexDaemonError::Health)?;
+    let mut publisher = crate::idunn_health::ProviderHealthPublisher::open(
+        endpoint,
+        daemon_id,
+        runtime_id,
+        contract,
+        &identity,
+        release.clone(),
+        activation.clone(),
+    )
+    .map_err(CodexDaemonError::Health)?;
+    let published = publisher
+        .publish("warming", "traffic-admission-pending")
         .map_err(CodexDaemonError::Health)?;
+    let traffic_admission = crate::idunn_health::ConnectorTrafficAdmissionGate::from_environment(
+        &release,
+        &activation,
+        &published,
+    )
+    .map_err(CodexDaemonError::Health)?;
+    traffic_admission
+        .wait_until_granted(Duration::from_secs(120))
+        .map_err(CodexDaemonError::Health)?;
+    Ok((traffic_admission, publisher))
+}
+
+#[cfg(target_os = "linux")]
+fn start_periodic_idunn_health_publisher(
+    mut publisher: crate::idunn_health::ProviderHealthPublisher,
+    backend: Arc<CodexProviderBackend>,
+) -> Result<(), CodexDaemonError> {
     thread::Builder::new()
         .name("codex-connector-health".to_string())
         .spawn(move || {
             loop {
                 thread::sleep(Duration::from_secs(10));
-                if let Err(error) =
-                    publisher.publish("active", "credential-isolated-transport-ready")
-                {
+                let (state, detail) = provider_health_observation(&backend);
+                if let Err(error) = publisher.publish(state, detail) {
                     eprintln!("codex-connector health publication failed: {error}");
                 }
             }
         })
         .map_err(CodexDaemonError::HealthThread)?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn provider_health_observation(backend: &CodexProviderBackend) -> (&'static str, &'static str) {
+    provider_health_state(backend.readiness().is_ok())
+}
+
+#[cfg(target_os = "linux")]
+fn provider_health_state(ready: bool) -> (&'static str, &'static str) {
+    if ready {
+        ("active", "credential-isolated-transport-ready")
+    } else {
+        ("degraded", "provider-backend-unready")
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -309,18 +441,27 @@ fn required_environment(name: &'static str) -> Result<String, CodexDaemonError> 
         .ok_or(CodexDaemonError::InvalidConfig(name))
 }
 
+#[derive(Clone)]
+pub(crate) struct LoadedCallerKeyBinding {
+    pub(crate) caller_runtime_id: String,
+    pub(crate) connection_key_file: PathBuf,
+    pub(crate) connection_key_epoch: u32,
+    pub(crate) raw_file_sha256: [u8; 32],
+}
+
 fn load_admissions(
     config: &CodexDaemonConfig,
-) -> Result<Vec<CodexCallerAdmission>, CodexDaemonError> {
-    config
-        .callers
-        .iter()
-        .map(|caller| {
-            let secret = Zeroizing::new(
-                fs::read_to_string(&caller.connection_key_file)
-                    .map_err(CodexDaemonError::ConnectionKey)?,
-            );
-            let secret = secret.trim_end_matches(['\r', '\n']);
+) -> Result<(Vec<CodexCallerAdmission>, Vec<LoadedCallerKeyBinding>), CodexDaemonError> {
+    let mut admissions = Vec::with_capacity(config.callers.len());
+    let mut bindings = Vec::with_capacity(config.callers.len());
+    for caller in &config.callers {
+        let raw = Zeroizing::new(
+            fs::read(&caller.connection_key_file).map_err(CodexDaemonError::ConnectionKey)?,
+        );
+        let secret = std::str::from_utf8(raw.as_slice())
+            .map_err(|_| CodexDaemonError::InvalidConfig("caller connection key encoding"))?
+            .trim_end_matches(['\r', '\n']);
+        admissions.push(
             CodexCallerAdmission::new(
                 caller.caller_runtime_id.clone(),
                 secret.to_string(),
@@ -330,15 +471,24 @@ fn load_admissions(
                 caller.max_payload_bytes,
                 caller.max_output_tokens,
             )
-            .map_err(CodexDaemonError::Service)
-        })
-        .collect()
+            .map_err(CodexDaemonError::Service)?,
+        );
+        bindings.push(LoadedCallerKeyBinding {
+            caller_runtime_id: caller.caller_runtime_id.clone(),
+            connection_key_file: caller.connection_key_file.clone(),
+            connection_key_epoch: caller.connection_key_epoch,
+            raw_file_sha256: sha2::Sha256::digest(raw.as_slice()).into(),
+        });
+    }
+    Ok((admissions, bindings))
 }
 
 fn serve_connection(
     mut stream: TcpStream,
     service: &Mutex<CodexTransportService>,
     backend: &CodexProviderBackend,
+    #[cfg(target_os = "linux")]
+    traffic_admission: &crate::idunn_health::ConnectorTrafficAdmissionGate,
     max_frame_bytes: usize,
     timeout: Duration,
 ) -> Result<(), CodexDaemonError> {
@@ -349,6 +499,13 @@ fn serve_connection(
     let request = read_transport_frame(&mut stream, max_frame_bytes).map_err(frame_error)?;
     let envelope: CodexTransportEnvelope =
         rmp_serde::from_slice(&request).map_err(|_| CodexDaemonError::FrameEncoding)?;
+    #[cfg(target_os = "linux")]
+    // This is the traffic-to-Connector authority transfer. The complete
+    // request is inert until the current root grant admits service.begin;
+    // backend consequence remains owned by the admitted request claim.
+    traffic_admission
+        .require_current()
+        .map_err(CodexDaemonError::Health)?;
     let admission = service
         .lock()
         .map_err(|_| CodexDaemonError::ServicePoisoned)?
@@ -435,7 +592,7 @@ pub enum CodexDaemonError {
     #[error("connector request thread failed")]
     Thread(#[source] std::io::Error),
     #[cfg(target_os = "linux")]
-    #[error("connector health publication could not start: {0}")]
+    #[error("connector signed health or traffic authority failed: {0}")]
     Health(#[source] anyhow::Error),
     #[cfg(target_os = "linux")]
     #[error("connector health thread could not start")]
@@ -448,8 +605,6 @@ pub enum CodexDaemonError {
     FrameEncoding,
     #[error("system clock is before the Unix epoch")]
     Clock,
-    #[error("connector listener closed")]
-    ListenerClosed,
 }
 
 #[cfg(test)]
@@ -482,6 +637,19 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn signed_health_never_reports_an_unready_provider_active() {
+        assert_eq!(
+            provider_health_state(true),
+            ("active", "credential-isolated-transport-ready")
+        );
+        assert_eq!(
+            provider_health_state(false),
+            ("degraded", "provider-backend-unready")
+        );
+    }
+
+    #[test]
     fn typed_cultcache_config_round_trips_and_refuses_epoch_substitution() {
         let root = std::env::temp_dir().join(format!(
             "codex-connector-config-{}-{}",
@@ -493,6 +661,10 @@ mod tests {
         let expected = config(&root);
         write_daemon_config(&path, &expected).unwrap();
         assert_eq!(load_daemon_config(&path).unwrap(), expected);
+        let exact_bytes = fs::read(&path).unwrap();
+        let (loaded, loaded_bytes) = load_daemon_config_snapshot(&path).unwrap();
+        assert_eq!(loaded, expected);
+        assert_eq!(loaded_bytes, exact_bytes);
 
         let mut stale = expected;
         stale.epoch = 0;
@@ -500,6 +672,26 @@ mod tests {
             write_daemon_config(&path, &stale),
             Err(CodexDaemonError::InvalidConfig("epoch"))
         ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn production_config_snapshot_never_creates_its_authority_lock() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-connector-read-only-config-{}-{}",
+            std::process::id(),
+            unix_ms().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("connector.cc");
+        write_daemon_config(&path, &config(&root)).unwrap();
+        let before = fs::read(&path).unwrap();
+        let lock_path = path.with_file_name("connector.cc.lock");
+        fs::remove_file(&lock_path).unwrap();
+
+        assert!(load_daemon_config_snapshot(&path).is_err());
+        assert!(!lock_path.exists());
+        assert_eq!(fs::read(&path).unwrap(), before);
         fs::remove_dir_all(root).unwrap();
     }
 

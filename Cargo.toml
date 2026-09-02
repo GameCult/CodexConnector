@@ -34,7 +34,7 @@ aes-gcm = "0.10"
 anyhow = { version = "1", optional = true }
 base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"], optional = true }
-cultcache-rs = { git = "https://github.com/GameCult/cultcache-rs.git", rev = "fdbf3bf0a4b3f6b617c224d7439feb8e69d4474c", optional = true }
+cultcache-rs = { git = "https://github.com/GameCult/cultcache-rs.git", rev = "4b61f4df32d7ee1ba718596b03504d444489e7b4", optional = true }
 cultnet-rs = { git = "https://github.com/GameCult/CultLib.git", rev = "75c180782aeba7cfd22d6412877397708a4ed28f", optional = true }
 ed25519-dalek = { version = "2.2", optional = true }
 rand_core = { version = "0.6", features = ["getrandom"] }
