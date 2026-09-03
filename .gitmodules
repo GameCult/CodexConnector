@@ -1,0 +1,6 @@
+[submodule "vendor/cultnet-rs"]
+	path = vendor/cultnet-rs
+	url = https://github.com/GameCult/cultnet-rs.git
+[submodule "vendor/cultcache-rs"]
+	path = vendor/cultcache-rs
+	url = https://github.com/GameCult/cultcache-rs.git

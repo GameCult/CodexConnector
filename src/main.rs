@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use codex_connector::{CodexCallerConfig, CodexDaemonConfig};
 
-const USAGE: &str = "usage:\n  codex-connector --config PATH.cc\n  codex-connector --initialize-single-caller-config PATH.cc BIND CODEX_EXECUTABLE CODEX_SHA256 CODEX_HOME REPLAY_STORE CALLER_RUNTIME_ID CONNECTION_KEY_FILE CONNECTION_KEY_EPOCH ALLOWED_MODELS_CSV MAX_CONCURRENT_REQUESTS MAX_PAYLOAD_BYTES MAX_OUTPUT_TOKENS\n  codex-connector --admit-caller-config SOURCE.cc DESTINATION.cc CALLER_RUNTIME_ID CONNECTION_KEY_FILE CONNECTION_KEY_EPOCH ALLOWED_MODELS_CSV MAX_CONCURRENT_REQUESTS MAX_PAYLOAD_BYTES MAX_OUTPUT_TOKENS";
+const USAGE: &str = "usage:\n  codex-connector --config PATH.cc\n  codex-connector --config PATH.cc --state-root PATH\n  codex-connector --initialize-single-caller-config PATH.cc BIND CODEX_EXECUTABLE CODEX_SHA256 CODEX_HOME REPLAY_STORE CALLER_RUNTIME_ID CONNECTION_KEY_FILE CONNECTION_KEY_EPOCH ALLOWED_MODELS_CSV MAX_CONCURRENT_REQUESTS MAX_PAYLOAD_BYTES MAX_OUTPUT_TOKENS\n  codex-connector --admit-caller-config SOURCE.cc DESTINATION.cc CALLER_RUNTIME_ID CONNECTION_KEY_FILE CONNECTION_KEY_EPOCH ALLOWED_MODELS_CSV MAX_CONCURRENT_REQUESTS MAX_PAYLOAD_BYTES MAX_OUTPUT_TOKENS";
 
 fn main() {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
@@ -29,14 +29,19 @@ fn main() {
         }
         return;
     }
-    let config = match args.as_slice() {
-        [flag, path] if flag == "--config" => PathBuf::from(path),
+    let (config, state_root) = match args.as_slice() {
+        [flag, path] if flag == "--config" => (PathBuf::from(path), None),
+        [config_flag, config, state_flag, state_root]
+            if config_flag == "--config" && state_flag == "--state-root" =>
+        {
+            (PathBuf::from(config), Some(PathBuf::from(state_root)))
+        }
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2);
         }
     };
-    if let Err(error) = codex_connector::serve(&config) {
+    if let Err(error) = codex_connector::serve(&config, state_root.as_deref()) {
         eprintln!("codex-connector stopped: {error}");
         std::process::exit(1);
     }

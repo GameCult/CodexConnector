@@ -8,11 +8,10 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "linux")]
-use std::time::Instant;
+use std::os::unix::fs::MetadataExt;
 
 use cultcache_rs::{CultCache, DatabaseEntry, SingleFileMessagePackBackingStore};
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -166,12 +165,15 @@ impl CodexDaemonConfig {
 }
 
 fn required_connection_capacity(callers: &[CodexCallerConfig]) -> Result<usize, CodexDaemonError> {
+    Ok(caller_request_capacity(callers)?.max(8))
+}
+
+fn caller_request_capacity(callers: &[CodexCallerConfig]) -> Result<usize, CodexDaemonError> {
     callers
         .iter()
         .try_fold(0_usize, |total, caller| {
             total.checked_add(caller.max_concurrent_requests)
         })
-        .map(|total| total.max(8))
         .ok_or(CodexDaemonError::InvalidConfig("connection capacity"))
 }
 
@@ -191,11 +193,9 @@ pub fn load_daemon_config(path: &Path) -> Result<CodexDaemonConfig, CodexDaemonE
     Ok(config)
 }
 
-fn load_daemon_config_snapshot(
-    path: &Path,
-) -> Result<(CodexDaemonConfig, Vec<u8>), CodexDaemonError> {
+fn load_daemon_config_read_only(path: &Path) -> Result<CodexDaemonConfig, CodexDaemonError> {
     let store = SingleFileMessagePackBackingStore::new(path);
-    let (config, snapshot) = store
+    let config = store
         .with_read_only_shared_snapshot(|entries| {
             let [envelope] = entries.as_slice() else {
                 anyhow::bail!("connector configuration must contain exactly one record");
@@ -210,12 +210,11 @@ fn load_daemon_config_snapshot(
             if rmp_serde::to_vec(&config)? != envelope.payload {
                 anyhow::bail!("connector configuration is not canonical positional MessagePack");
             }
-            let snapshot = fs::read(path)?;
-            Ok((config, snapshot))
+            Ok(config)
         })
         .map_err(config_store_error)?;
     config.validate()?;
-    Ok((config, snapshot))
+    Ok(config)
 }
 
 pub fn write_daemon_config(
@@ -235,73 +234,106 @@ pub fn write_daemon_config(
     Ok(())
 }
 
-pub fn serve(config_path: &Path) -> Result<(), CodexDaemonError> {
-    let (config, config_bytes) = load_daemon_config_snapshot(config_path)?;
-    let bind = config.validate()?;
-    let (admissions, caller_key_bindings) = load_admissions(&config)?;
+pub fn serve(
+    config_path: &Path,
+    managed_state_root: Option<&Path>,
+) -> Result<(), CodexDaemonError> {
     #[cfg(target_os = "linux")]
-    let (traffic_admission, prepared_health_publisher) =
-        start_idunn_health_publisher(config_path, &config_bytes, &config, &caller_key_bindings)?;
+    if std::env::var_os(crate::idunn_health::IDUNN_RUNTIME_BUNDLE_ENVIRONMENT).is_some() {
+        crate::idunn_health::require_managed_config_store(config_path)
+            .map_err(CodexDaemonError::Health)?;
+    }
+    let config = load_daemon_config_read_only(config_path)?;
+    let configured_bind = config.validate()?;
+    #[cfg(target_os = "linux")]
+    let bind = effective_bind_from_environment(configured_bind)?;
+    #[cfg(not(target_os = "linux"))]
+    let bind = configured_bind;
+    #[cfg(target_os = "linux")]
+    let (mut codex_executable, mut codex_home, mut replay_store) =
+        effective_runtime_paths_from_environment(&config, managed_state_root)?;
+    #[cfg(not(target_os = "linux"))]
+    let (codex_executable, codex_home, replay_store) = match managed_state_root {
+        None => (
+            config.codex_executable.clone(),
+            config.codex_home.clone(),
+            config.replay_store.clone(),
+        ),
+        Some(_) => {
+            return Err(CodexDaemonError::InvalidConfig(
+                "Idunn state root on an unmanaged platform",
+            ));
+        }
+    };
+    let admissions = load_admissions(&config)?;
 
-    // Probation performs only immutable activation verification and its one
-    // signed warming publication. Provider process, replay, and socket
-    // actuation begin only after Idunn grants that exact startup statement.
+    #[cfg(target_os = "linux")]
+    // Consume the systemd-owned signer descriptors before opening another
+    // process descriptor. Their numeric 3/4 contract is valid only at the
+    // managed process entry boundary.
+    let mut prepared_presence_publisher = prepare_runtime_presence_publisher(bind, &config)?;
+
+    // Binding the candidate socket is service physiology. Idunn owns whether
+    // that candidate receives traffic, so Connector carries no second route
+    // or traffic-admission gate.
+    let listener = TcpListener::bind(bind).map_err(CodexDaemonError::Listen)?;
+    let bound = listener.local_addr().map_err(CodexDaemonError::Listen)?;
+    #[cfg(target_os = "linux")]
+    if let Some(publisher) = prepared_presence_publisher.as_mut() {
+        if bound != bind {
+            return Err(CodexDaemonError::InvalidConfig("Idunn candidate bind"));
+        }
+        let warming_sha256 = publisher
+            .publish("warming", "awaiting-process-write-lease")
+            .map_err(CodexDaemonError::Health)?;
+        publisher
+            .acquire_process_write_lease(&warming_sha256, Duration::from_secs(120))
+            .map_err(CodexDaemonError::Health)?;
+        // The incumbent is fenced only when Idunn can replace the lease under
+        // our shared lock. Re-observe every write-capable path after that
+        // handoff so a pre-lease filesystem shape cannot survive into Active.
+        (codex_executable, codex_home, replay_store) =
+            effective_runtime_paths_from_environment(&config, managed_state_root)?;
+    }
+    #[cfg(target_os = "linux")]
+    // Keep the shared lease lock in the main service body as well as the
+    // publisher thread. A health-thread failure must not release write
+    // authority while replay or the official credential writer remains live.
+    let _process_write_lease_guard = prepared_presence_publisher
+        .as_ref()
+        .map(|publisher| publisher.process_write_lease_guard())
+        .transpose()
+        .map_err(CodexDaemonError::Health)?;
+
+    // Opening replay state is the first persistent write-capable actuation.
+    // Managed launches reach this point only after the exact warming process
+    // has received Idunn's typed process-write lease.
     let backend = Arc::new(CodexProviderBackend::start(CodexAppServerConfig {
-        executable: config.codex_executable.clone(),
+        executable: codex_executable,
         executable_sha256: config.codex_executable_sha256,
-        codex_home: config.codex_home.clone(),
+        codex_home,
         max_result_bytes: config.max_frame_bytes - FRAME_OVERHEAD_BUDGET,
     })?);
     let readiness = backend.readiness()?;
     let service = Arc::new(Mutex::new(CodexTransportService::open(
-        &config.replay_store,
+        &replay_store,
         admissions,
         config.max_expiry_skew_ms,
     )?));
     #[cfg(target_os = "linux")]
-    traffic_admission
-        .require_current()
-        .map_err(CodexDaemonError::Health)?;
-    let listener = TcpListener::bind(bind).map_err(CodexDaemonError::Listen)?;
-    #[cfg(target_os = "linux")]
-    listener
-        .set_nonblocking(true)
-        .map_err(CodexDaemonError::Listen)?;
-    #[cfg(target_os = "linux")]
-    start_periodic_idunn_health_publisher(prepared_health_publisher, backend.clone())?;
+    if let Some(publisher) = prepared_presence_publisher {
+        start_periodic_runtime_presence_publisher(publisher, backend.clone())?;
+    }
     let active_connections = Arc::new(AtomicUsize::new(0));
-    #[cfg(target_os = "linux")]
-    let mut next_traffic_admission_check = Instant::now();
     eprintln!(
         "codex-connector ready at {} for {} callers using {:?}",
-        listener.local_addr().map_err(CodexDaemonError::Listen)?,
+        bound,
         config.callers.len(),
         readiness.auth_mode
     );
 
     loop {
-        #[cfg(target_os = "linux")]
-        if Instant::now() >= next_traffic_admission_check {
-            traffic_admission
-                .require_current()
-                .map_err(CodexDaemonError::Health)?;
-            next_traffic_admission_check = Instant::now() + Duration::from_millis(100);
-        }
-        let stream = match listener.accept() {
-            Ok((stream, _)) => stream,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(100));
-                continue;
-            }
-            Err(error) => return Err(CodexDaemonError::Listen(error)),
-        };
-        #[cfg(target_os = "linux")]
-        // The polling check terminates an idle process after revocation. This
-        // second check is the traffic commit point: an accepted socket receives
-        // no request worker under a stale grant.
-        traffic_admission
-            .require_current()
-            .map_err(CodexDaemonError::Health)?;
+        let (stream, _) = listener.accept().map_err(CodexDaemonError::Listen)?;
         if !stream
             .peer_addr()
             .map_err(CodexDaemonError::Connection)?
@@ -317,93 +349,43 @@ pub fn serve(config_path: &Path) -> Result<(), CodexDaemonError> {
         };
         let service = service.clone();
         let backend = backend.clone();
-        #[cfg(target_os = "linux")]
-        let request_traffic_admission = traffic_admission.clone();
         let max_frame_bytes = config.max_frame_bytes;
         let timeout = Duration::from_millis(config.socket_timeout_ms);
         thread::Builder::new()
             .name("codex-connector-request".to_string())
             .spawn(move || {
                 let _permit = permit;
-                let _ = serve_connection(
-                    stream,
-                    &service,
-                    &backend,
-                    #[cfg(target_os = "linux")]
-                    &request_traffic_admission,
-                    max_frame_bytes,
-                    timeout,
-                );
+                let _ = serve_connection(stream, &service, &backend, max_frame_bytes, timeout);
             })
             .map_err(CodexDaemonError::Thread)?;
     }
 }
 
 #[cfg(target_os = "linux")]
-fn start_idunn_health_publisher(
-    config_path: &Path,
-    config_bytes: &[u8],
+fn prepare_runtime_presence_publisher(
+    candidate: SocketAddr,
     config: &CodexDaemonConfig,
-    caller_key_bindings: &[LoadedCallerKeyBinding],
-) -> Result<
-    (
-        crate::idunn_health::ConnectorTrafficAdmissionGate,
-        crate::idunn_health::ProviderHealthPublisher,
-    ),
-    CodexDaemonError,
-> {
-    let endpoint = required_environment("CODEX_CONNECTOR_IDUNN_RUDP")?
-        .parse::<SocketAddr>()
-        .map_err(|_| CodexDaemonError::InvalidConfig("Idunn health endpoint"))?;
-    let daemon_id = required_environment("CODEX_CONNECTOR_IDUNN_DAEMON")?;
-    let runtime_id = required_environment("CODEX_CONNECTOR_RUNTIME_ID")?;
-    let contract = std::env::var("CODEX_CONNECTOR_IDUNN_HEALTH_CONTRACT")
-        .unwrap_or_else(|_| crate::idunn_health::CODEX_CONNECTOR_IDUNN_HEALTH_CONTRACT.to_string());
-    let identity = PathBuf::from(required_environment(
-        "CODEX_CONNECTOR_IDUNN_HEALTH_IDENTITY",
-    )?);
-    let release = crate::idunn_health::active_release_binding(
-        &config.codex_executable,
-        &config.codex_executable_sha256,
-    )
-    .map_err(CodexDaemonError::Health)?;
-    let activation = crate::idunn_health::active_activation_binding(
-        config_path,
-        config_bytes,
-        config,
-        caller_key_bindings,
-    )
-    .map_err(CodexDaemonError::Health)?;
-    let mut publisher = crate::idunn_health::ProviderHealthPublisher::open(
-        endpoint,
-        daemon_id,
-        runtime_id,
-        contract,
-        &identity,
-        release.clone(),
-        activation.clone(),
-    )
-    .map_err(CodexDaemonError::Health)?;
-    let published = publisher
-        .publish("warming", "traffic-admission-pending")
-        .map_err(CodexDaemonError::Health)?;
-    let traffic_admission = crate::idunn_health::ConnectorTrafficAdmissionGate::from_environment(
-        &release,
-        &activation,
-        &published,
-    )
-    .map_err(CodexDaemonError::Health)?;
-    traffic_admission
-        .wait_until_granted(Duration::from_secs(120))
-        .map_err(CodexDaemonError::Health)?;
-    Ok((traffic_admission, publisher))
+) -> Result<Option<crate::idunn_health::RuntimePresencePublisher>, CodexDaemonError> {
+    if std::env::var_os(crate::idunn_health::IDUNN_RUNTIME_BUNDLE_ENVIRONMENT).is_none() {
+        return Ok(None);
+    }
+    let capacity = u32::try_from(caller_request_capacity(&config.callers)?)
+        .map_err(|_| CodexDaemonError::InvalidConfig("runtime capability capacity"))?;
+    let publisher =
+        crate::idunn_health::RuntimePresencePublisher::open_from_environment(candidate, capacity)
+            .map_err(CodexDaemonError::Health)?;
+    Ok(Some(publisher))
 }
 
 #[cfg(target_os = "linux")]
-fn start_periodic_idunn_health_publisher(
-    mut publisher: crate::idunn_health::ProviderHealthPublisher,
+fn start_periodic_runtime_presence_publisher(
+    mut publisher: crate::idunn_health::RuntimePresencePublisher,
     backend: Arc<CodexProviderBackend>,
 ) -> Result<(), CodexDaemonError> {
+    let (state, detail) = provider_health_observation(&backend);
+    publisher
+        .publish(state, detail)
+        .map_err(CodexDaemonError::Health)?;
     thread::Builder::new()
         .name("codex-connector-health".to_string())
         .spawn(move || {
@@ -434,26 +416,131 @@ fn provider_health_state(ready: bool) -> (&'static str, &'static str) {
 }
 
 #[cfg(target_os = "linux")]
-fn required_environment(name: &'static str) -> Result<String, CodexDaemonError> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty() && value == value.trim())
-        .ok_or(CodexDaemonError::InvalidConfig(name))
+fn effective_bind_from_environment(configured: SocketAddr) -> Result<SocketAddr, CodexDaemonError> {
+    select_effective_bind(
+        configured,
+        std::env::var(crate::idunn_health::IDUNN_RUNTIME_BUNDLE_ENVIRONMENT).ok(),
+        std::env::var(crate::idunn_health::IDUNN_CANDIDATE_BIND_ENVIRONMENT).ok(),
+    )
 }
 
-#[derive(Clone)]
-pub(crate) struct LoadedCallerKeyBinding {
-    pub(crate) caller_runtime_id: String,
-    pub(crate) connection_key_file: PathBuf,
-    pub(crate) connection_key_epoch: u32,
-    pub(crate) raw_file_sha256: [u8; 32],
+#[cfg(target_os = "linux")]
+fn effective_runtime_paths_from_environment(
+    config: &CodexDaemonConfig,
+    managed_state_root: Option<&Path>,
+) -> Result<(PathBuf, PathBuf, PathBuf), CodexDaemonError> {
+    if std::env::var_os(crate::idunn_health::IDUNN_RUNTIME_BUNDLE_ENVIRONMENT).is_none() {
+        if managed_state_root.is_some() {
+            return Err(CodexDaemonError::InvalidConfig(
+                "Idunn state root outside a managed launch",
+            ));
+        }
+        return Ok((
+            config.codex_executable.clone(),
+            config.codex_home.clone(),
+            config.replay_store.clone(),
+        ));
+    }
+    let managed_state_root =
+        managed_state_root.ok_or(CodexDaemonError::InvalidConfig("missing Idunn state root"))?;
+
+    let running = std::env::current_exe()
+        .and_then(fs::canonicalize)
+        .map_err(|_| CodexDaemonError::InvalidConfig("managed Connector executable"))?;
+    managed_runtime_paths(config, &running, managed_state_root)
+}
+
+#[cfg(target_os = "linux")]
+fn managed_runtime_paths(
+    config: &CodexDaemonConfig,
+    running: &Path,
+    state_root: &Path,
+) -> Result<(PathBuf, PathBuf, PathBuf), CodexDaemonError> {
+    let adjacent_codex = running
+        .parent()
+        .ok_or(CodexDaemonError::InvalidConfig(
+            "managed Connector executable",
+        ))?
+        .join("codex");
+    let adjacent_codex = fs::canonicalize(adjacent_codex)
+        .map_err(|_| CodexDaemonError::InvalidConfig("managed Codex executable"))?;
+    let configured_codex = fs::canonicalize(&config.codex_executable)
+        .map_err(|_| CodexDaemonError::InvalidConfig("managed Codex executable"))?;
+    if configured_codex != adjacent_codex {
+        return Err(CodexDaemonError::InvalidConfig("managed Codex executable"));
+    }
+
+    if !state_root.is_absolute() {
+        return Err(CodexDaemonError::InvalidConfig("managed state root"));
+    }
+    let canonical_state_root = fs::canonicalize(state_root)
+        .map_err(|_| CodexDaemonError::InvalidConfig("managed state root"))?;
+    let state_root_metadata = fs::symlink_metadata(state_root)
+        .map_err(|_| CodexDaemonError::InvalidConfig("managed state root"))?;
+    if canonical_state_root != state_root
+        || !state_root_metadata.is_dir()
+        || state_root_metadata.file_type().is_symlink()
+    {
+        return Err(CodexDaemonError::InvalidConfig("managed state root"));
+    }
+
+    let codex_home = state_root.join("codex-home");
+    if config.codex_home != codex_home {
+        return Err(CodexDaemonError::InvalidConfig("managed state layout"));
+    }
+    match fs::symlink_metadata(&codex_home) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Err(CodexDaemonError::InvalidConfig("managed state layout")),
+    }
+
+    let replay_store = state_root.join("replay.cc");
+    if config.replay_store != replay_store {
+        return Err(CodexDaemonError::InvalidConfig("managed state layout"));
+    }
+    match fs::symlink_metadata(&replay_store) {
+        Ok(metadata)
+            if metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.nlink() == 1 => {}
+        Ok(_) => return Err(CodexDaemonError::InvalidConfig("managed state layout")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(CodexDaemonError::InvalidConfig("managed state layout")),
+    }
+    Ok((adjacent_codex, codex_home, replay_store))
+}
+
+#[cfg(target_os = "linux")]
+fn select_effective_bind(
+    configured: SocketAddr,
+    runtime_bundle: Option<String>,
+    candidate_bind: Option<String>,
+) -> Result<SocketAddr, CodexDaemonError> {
+    match (runtime_bundle, candidate_bind) {
+        (None, None) => Ok(configured),
+        (Some(bundle), Some(candidate))
+            if !bundle.trim().is_empty()
+                && bundle.trim() == bundle
+                && candidate.trim() == candidate =>
+        {
+            let bind = candidate
+                .parse::<SocketAddr>()
+                .map_err(|_| CodexDaemonError::InvalidConfig("Idunn candidate bind"))?;
+            if !bind.ip().is_loopback() {
+                return Err(CodexDaemonError::InvalidConfig("Idunn candidate bind"));
+            }
+            Ok(bind)
+        }
+        _ => Err(CodexDaemonError::InvalidConfig(
+            "partial Idunn managed runtime environment",
+        )),
+    }
 }
 
 fn load_admissions(
     config: &CodexDaemonConfig,
-) -> Result<(Vec<CodexCallerAdmission>, Vec<LoadedCallerKeyBinding>), CodexDaemonError> {
+) -> Result<Vec<CodexCallerAdmission>, CodexDaemonError> {
     let mut admissions = Vec::with_capacity(config.callers.len());
-    let mut bindings = Vec::with_capacity(config.callers.len());
     for caller in &config.callers {
         let raw = Zeroizing::new(
             fs::read(&caller.connection_key_file).map_err(CodexDaemonError::ConnectionKey)?,
@@ -473,22 +560,14 @@ fn load_admissions(
             )
             .map_err(CodexDaemonError::Service)?,
         );
-        bindings.push(LoadedCallerKeyBinding {
-            caller_runtime_id: caller.caller_runtime_id.clone(),
-            connection_key_file: caller.connection_key_file.clone(),
-            connection_key_epoch: caller.connection_key_epoch,
-            raw_file_sha256: sha2::Sha256::digest(raw.as_slice()).into(),
-        });
     }
-    Ok((admissions, bindings))
+    Ok(admissions)
 }
 
 fn serve_connection(
     mut stream: TcpStream,
     service: &Mutex<CodexTransportService>,
     backend: &CodexProviderBackend,
-    #[cfg(target_os = "linux")]
-    traffic_admission: &crate::idunn_health::ConnectorTrafficAdmissionGate,
     max_frame_bytes: usize,
     timeout: Duration,
 ) -> Result<(), CodexDaemonError> {
@@ -499,13 +578,6 @@ fn serve_connection(
     let request = read_transport_frame(&mut stream, max_frame_bytes).map_err(frame_error)?;
     let envelope: CodexTransportEnvelope =
         rmp_serde::from_slice(&request).map_err(|_| CodexDaemonError::FrameEncoding)?;
-    #[cfg(target_os = "linux")]
-    // This is the traffic-to-Connector authority transfer. The complete
-    // request is inert until the current root grant admits service.begin;
-    // backend consequence remains owned by the admitted request claim.
-    traffic_admission
-        .require_current()
-        .map_err(CodexDaemonError::Health)?;
     let admission = service
         .lock()
         .map_err(|_| CodexDaemonError::ServicePoisoned)?
@@ -592,7 +664,7 @@ pub enum CodexDaemonError {
     #[error("connector request thread failed")]
     Thread(#[source] std::io::Error),
     #[cfg(target_os = "linux")]
-    #[error("connector signed health or traffic authority failed: {0}")]
+    #[error("connector runtime presence failed: {0}")]
     Health(#[source] anyhow::Error),
     #[cfg(target_os = "linux")]
     #[error("connector health thread could not start")]
@@ -661,10 +733,8 @@ mod tests {
         let expected = config(&root);
         write_daemon_config(&path, &expected).unwrap();
         assert_eq!(load_daemon_config(&path).unwrap(), expected);
-        let exact_bytes = fs::read(&path).unwrap();
-        let (loaded, loaded_bytes) = load_daemon_config_snapshot(&path).unwrap();
+        let loaded = load_daemon_config_read_only(&path).unwrap();
         assert_eq!(loaded, expected);
-        assert_eq!(loaded_bytes, exact_bytes);
 
         let mut stale = expected;
         stale.epoch = 0;
@@ -689,10 +759,58 @@ mod tests {
         let lock_path = path.with_file_name("connector.cc.lock");
         fs::remove_file(&lock_path).unwrap();
 
-        assert!(load_daemon_config_snapshot(&path).is_err());
+        assert!(load_daemon_config_read_only(&path).is_err());
         assert!(!lock_path.exists());
         assert_eq!(fs::read(&path).unwrap(), before);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn managed_runtime_refuses_a_mutable_config_authority() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-connector-managed-config-{}-{}",
+            std::process::id(),
+            unix_ms().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("connector.cc");
+        write_daemon_config(&path, &config(&root)).unwrap();
+
+        assert!(crate::idunn_health::require_managed_config_store(&path).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn idunn_candidate_bind_replaces_config_only_for_a_complete_managed_launch() {
+        let configured = "127.0.0.1:4103".parse().unwrap();
+        let candidate = "127.0.0.1:18831".parse().unwrap();
+        assert_eq!(
+            select_effective_bind(configured, None, None).unwrap(),
+            configured
+        );
+        assert_eq!(
+            select_effective_bind(
+                configured,
+                Some("/run/idunn/runtime/instance".into()),
+                Some("127.0.0.1:18831".into()),
+            )
+            .unwrap(),
+            candidate
+        );
+        assert!(
+            select_effective_bind(configured, Some("/run/idunn/runtime/instance".into()), None,)
+                .is_err()
+        );
+        assert!(
+            select_effective_bind(
+                configured,
+                Some("/run/idunn/runtime/instance".into()),
+                Some("0.0.0.0:18831".into()),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -780,6 +898,66 @@ mod tests {
             config.validate(),
             Err(CodexDaemonError::InvalidConfig("connection capacity"))
         ));
+    }
+
+    #[test]
+    fn provider_capacity_is_caller_execution_capacity_not_listener_capacity() {
+        let root = Path::new("/srv/codex-connector");
+        let mut config = config(root);
+        config.max_connections = 64;
+        assert_eq!(caller_request_capacity(&config.callers).unwrap(), 4);
+        assert_eq!(required_connection_capacity(&config.callers).unwrap(), 8);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn managed_runtime_uses_the_sealed_adjacent_codex_and_declared_state_layout() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-connector-layout-{}-{}",
+            std::process::id(),
+            unix_ms().unwrap()
+        ));
+        let release = root.join("release");
+        let state = root.join("state");
+        fs::create_dir_all(release.clone()).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        fs::write(release.join("codex-connector"), b"connector").unwrap();
+        fs::write(release.join("codex"), b"codex").unwrap();
+        let mut config = config(&root);
+        config.codex_executable = release.join("codex");
+        config.codex_home = state.join("codex-home");
+        config.replay_store = state.join("replay.cc");
+
+        let (_, codex_home, replay_store) =
+            managed_runtime_paths(&config, &release.join("codex-connector"), &state).unwrap();
+        assert_eq!(codex_home, state.join("codex-home"));
+        assert_eq!(
+            replay_store,
+            fs::canonicalize(&state).unwrap().join("replay.cc")
+        );
+
+        fs::write(&replay_store, b"replay").unwrap();
+        let replay_alias = state.join("replay-alias.cc");
+        fs::hard_link(&replay_store, &replay_alias).unwrap();
+        assert!(managed_runtime_paths(&config, &release.join("codex-connector"), &state).is_err());
+        fs::remove_file(&replay_alias).unwrap();
+        fs::remove_file(&replay_store).unwrap();
+        std::os::unix::fs::symlink(state.join("missing-replay.cc"), &replay_store).unwrap();
+        assert!(managed_runtime_paths(&config, &release.join("codex-connector"), &state).is_err());
+        fs::remove_file(&replay_store).unwrap();
+
+        config.codex_executable = root.join("other-codex");
+        fs::write(&config.codex_executable, b"other").unwrap();
+        assert!(managed_runtime_paths(&config, &release.join("codex-connector"), &state).is_err());
+
+        config.codex_executable = release.join("codex");
+        let other_state = root.join("other-state");
+        fs::create_dir_all(other_state.join("codex-home")).unwrap();
+        assert!(
+            managed_runtime_paths(&config, &release.join("codex-connector"), &other_state,)
+                .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

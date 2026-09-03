@@ -635,6 +635,7 @@ impl CodexAppServerAuthority {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        strip_systemd_descriptor_environment(&mut command);
         let mut child = command.spawn().map_err(CodexProviderBackendError::Spawn)?;
         let stdin = match child.stdin.take() {
             Some(stdin) => stdin,
@@ -695,6 +696,13 @@ impl CodexAppServerAuthority {
             .map_err(CodexProviderBackendError::AuthFile)?;
         parse_auth_file(&auth_bytes, account)
     }
+}
+
+pub(crate) fn strip_systemd_descriptor_environment(command: &mut Command) {
+    command
+        .env_remove("LISTEN_PID")
+        .env_remove("LISTEN_FDS")
+        .env_remove("LISTEN_FDNAMES");
 }
 
 fn codex_cli_version_from_user_agent(

@@ -1,0 +1,124 @@
+schema = "gamecult.idunn.target_declaration.v1"
+target = "codex-connector"
+source_stamp_environment = "CODEX_CONNECTOR_BUILD_COMMIT"
+required_gitlinks = ["vendor/cultcache-rs", "vendor/cultnet-rs"]
+
+[[steps]]
+id = "extract-codex"
+phase = "prepare"
+runner = "rust-build"
+argv = [
+  "tar",
+  "--extract",
+  "--gzip",
+  "--file",
+  ".idunn-inputs/codex-linux-x64.tgz",
+  "--strip-components=4",
+  "package/vendor/x86_64-unknown-linux-musl/bin/codex",
+]
+
+[[steps]]
+id = "test-contract"
+phase = "test"
+runner = "rust-build"
+argv = ["cargo", "test", "--locked"]
+
+[[steps]]
+id = "test-daemon"
+phase = "test"
+runner = "rust-build"
+argv = ["cargo", "test", "--locked", "--features", "daemon"]
+
+[[steps]]
+id = "build-daemon"
+phase = "build"
+runner = "rust-build"
+argv = [
+  "cargo",
+  "build",
+  "--locked",
+  "--release",
+  "--features",
+  "daemon",
+  "--bin",
+  "codex-connector",
+]
+
+[[external_inputs]]
+id = "codex-linux-x64"
+url = "https://registry.npmjs.org/@openai/codex/-/codex-0.150.0-alpha.7-linux-x64.tgz"
+sha256 = "8aca3112aef60127d4ffaf4c6f08e524fa7315279a1d08e7aa9c5e7f1a6943e0"
+runner = "rust-build"
+destination = ".idunn-inputs/codex-linux-x64.tgz"
+
+[[artifacts]]
+id = "codex-connector"
+source_kind = "runner-output"
+runner = "rust-build"
+source = "target/release/codex-connector"
+destination = "codex-connector"
+executable = true
+
+[[artifacts]]
+id = "codex"
+source_kind = "runner-output"
+runner = "rust-build"
+source = "codex"
+destination = "codex"
+expected_sha256 = "aca268dc02dcef8b1ea9f528a10173d5071ae76d659a03cce6458bbebe228bee"
+executable = true
+
+[service]
+executable_artifact = "codex-connector"
+required_adjacent_artifacts = ["codex"]
+arguments = [
+  { kind = "literal", value = "--config" },
+  { kind = "binding", name = "config_path" },
+  { kind = "literal", value = "--state-root" },
+  { kind = "binding", name = "state_root" },
+]
+transport = "tcp"
+route_required = true
+required_environment = [
+  "CODEX_CONNECTOR_CULTNET_RUDP",
+  "GAMECULT_IDUNN_CANDIDATE_BIND",
+  "GAMECULT_IDUNN_PROCESS_WRITE_LEASE",
+  "GAMECULT_IDUNN_RUNTIME_BUNDLE",
+]
+optional_environment = ["RUST_LOG"]
+
+[service.health]
+contract = "codex-connector.runtime-health.v1"
+
+[state]
+schema_generation = "connector-v1"
+
+[[state.slots]]
+id = "replay"
+relative_path = "replay.cc"
+kind = "cultcache-file"
+schema = "gamecult.codex.replay_record.v1"
+writer = "process-bound-single-writer"
+recovery = "preserve"
+startup = "create-or-open-after-write-lease"
+
+[[state.slots]]
+id = "codex-auth"
+relative_path = "codex-home/auth.json"
+kind = "external-file"
+schema = "openai.codex.auth-json.v1"
+writer = "process-bound-single-writer"
+recovery = "preserve"
+startup = "create-or-open-after-write-lease"
+
+[[provides]]
+capability = "gamecult.codex.subscription-inference"
+schema = "gamecult.codex.transport_envelope.v2"
+compatibility = "v2"
+
+[[dependencies]]
+kind = "bootstrap"
+capability = "odin.verse-rendezvous"
+schema = "odin.verse-topology.v1"
+compatibility = "v1"
+startup = "before-start"

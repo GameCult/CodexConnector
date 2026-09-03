@@ -145,18 +145,17 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "chrono",
- "cultcache-rs 0.1.0 (git+https://github.com/GameCult/cultcache-rs.git?rev=4b61f4df32d7ee1ba718596b03504d444489e7b4)",
+ "cultcache-rs",
  "cultnet-rs",
- "ed25519-dalek",
+ "fs2",
+ "libc",
  "rand_core 0.6.4",
  "rmp-serde",
  "serde",
- "serde_bytes",
  "serde_json",
  "sha2",
  "thiserror",
  "ureq",
- "uuid",
  "zeroize",
 ]
 
@@ -204,12 +203,12 @@ dependencies = [
 [[package]]
 name = "cultcache-rs"
 version = "0.1.0"
-source = "git+https://github.com/GameCult/CultLib.git?rev=75c180782aeba7cfd22d6412877397708a4ed28f#75c180782aeba7cfd22d6412877397708a4ed28f"
 dependencies = [
  "anyhow",
  "chrono",
- "cultcache-rs-derive 0.1.0 (git+https://github.com/GameCult/CultLib.git?rev=75c180782aeba7cfd22d6412877397708a4ed28f)",
+ "cultcache-rs-derive",
  "fs2",
+ "redb",
  "rmp-serde",
  "serde",
  "serde_bytes",
@@ -219,35 +218,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "cultcache-rs"
-version = "0.1.0"
-source = "git+https://github.com/GameCult/cultcache-rs.git?rev=4b61f4df32d7ee1ba718596b03504d444489e7b4#4b61f4df32d7ee1ba718596b03504d444489e7b4"
-dependencies = [
- "anyhow",
- "chrono",
- "cultcache-rs-derive 0.1.0 (git+https://github.com/GameCult/cultcache-rs.git?rev=4b61f4df32d7ee1ba718596b03504d444489e7b4)",
- "fs2",
- "rmp-serde",
- "serde",
- "serde_bytes",
- "serde_json",
- "uuid",
-]
-
-[[package]]
 name = "cultcache-rs-derive"
 version = "0.1.0"
-source = "git+https://github.com/GameCult/CultLib.git?rev=75c180782aeba7cfd22d6412877397708a4ed28f#75c180782aeba7cfd22d6412877397708a4ed28f"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "cultcache-rs-derive"
-version = "0.1.0"
-source = "git+https://github.com/GameCult/cultcache-rs.git?rev=4b61f4df32d7ee1ba718596b03504d444489e7b4#4b61f4df32d7ee1ba718596b03504d444489e7b4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -257,13 +229,13 @@ dependencies = [
 [[package]]
 name = "cultnet-rs"
 version = "0.1.0"
-source = "git+https://github.com/GameCult/CultLib.git?rev=75c180782aeba7cfd22d6412877397708a4ed28f#75c180782aeba7cfd22d6412877397708a4ed28f"
 dependencies = [
  "aes-gcm",
  "anyhow",
  "base64 0.22.1",
  "chrono",
- "cultcache-rs 0.1.0 (git+https://github.com/GameCult/CultLib.git?rev=75c180782aeba7cfd22d6412877397708a4ed28f)",
+ "cultcache-rs",
+ "ed25519-dalek",
  "hmac",
  "rand",
  "rmp-serde",
@@ -274,6 +246,8 @@ dependencies = [
  "sha2",
  "socket2",
  "uuid",
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -671,6 +645,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
  "getrandom 0.3.4",
+]
+
+[[package]]
+name = "redb"
+version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de6c3b63e007e90ce536ec2ae4690826136a20ec8dbbbb400daef1bb999d2e36"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -1171,6 +1154,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets",
+]
+
+[[package]]
+name = "windows-sys"
+version = "0.61.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
+dependencies = [
+ "windows-link",
 ]
 
 [[package]]

@@ -23,10 +23,9 @@ daemon = [
   "dep:chrono",
   "dep:cultcache-rs",
   "dep:cultnet-rs",
-  "dep:ed25519-dalek",
-  "dep:serde_bytes",
+  "dep:fs2",
+  "dep:libc",
   "dep:ureq",
-  "dep:uuid",
 ]
 
 [dependencies]
@@ -34,16 +33,15 @@ aes-gcm = "0.10"
 anyhow = { version = "1", optional = true }
 base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"], optional = true }
-cultcache-rs = { git = "https://github.com/GameCult/cultcache-rs.git", rev = "4b61f4df32d7ee1ba718596b03504d444489e7b4", optional = true }
-cultnet-rs = { git = "https://github.com/GameCult/CultLib.git", rev = "75c180782aeba7cfd22d6412877397708a4ed28f", optional = true }
-ed25519-dalek = { version = "2.2", optional = true }
+cultcache-rs = { path = "vendor/cultcache-rs", optional = true }
+cultnet-rs = { path = "vendor/cultnet-rs", optional = true }
+fs2 = { version = "0.4", optional = true }
+libc = { version = "0.2", optional = true }
 rand_core = { version = "0.6", features = ["getrandom"] }
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
-serde_bytes = { version = "0.11", optional = true }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 ureq = { version = "3.4", default-features = false, features = ["rustls"], optional = true }
-uuid = { version = "1", features = ["v4"], optional = true }
 zeroize = "1"
