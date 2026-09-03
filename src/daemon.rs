@@ -15,6 +15,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+#[cfg(target_os = "linux")]
+use cultnet_rs::{
+    CultNetMessage, CultNetWireContract, GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA,
+    decode_cultnet_message_from_slice, encode_cultnet_message_to_vec,
+};
+
 use crate::{
     CodexAppServerConfig, CodexCallerAdmission, CodexProviderBackend, CodexProviderBackendError,
     CodexTransportAdmission, CodexTransportEnvelope, CodexTransportService, ServiceError,
@@ -321,8 +327,11 @@ pub fn serve(
         config.max_expiry_skew_ms,
     )?));
     #[cfg(target_os = "linux")]
-    if let Some(publisher) = prepared_presence_publisher {
-        start_periodic_runtime_presence_publisher(publisher, backend.clone())?;
+    let runtime_presence_publisher =
+        prepared_presence_publisher.map(|publisher| Arc::new(Mutex::new(publisher)));
+    #[cfg(target_os = "linux")]
+    if let Some(publisher) = runtime_presence_publisher.as_ref() {
+        start_periodic_runtime_presence_publisher(publisher.clone(), backend.clone())?;
     }
     let active_connections = Arc::new(AtomicUsize::new(0));
     eprintln!(
@@ -349,13 +358,23 @@ pub fn serve(
         };
         let service = service.clone();
         let backend = backend.clone();
+        #[cfg(target_os = "linux")]
+        let runtime_presence_publisher = runtime_presence_publisher.clone();
         let max_frame_bytes = config.max_frame_bytes;
         let timeout = Duration::from_millis(config.socket_timeout_ms);
         thread::Builder::new()
             .name("codex-connector-request".to_string())
             .spawn(move || {
                 let _permit = permit;
-                let _ = serve_connection(stream, &service, &backend, max_frame_bytes, timeout);
+                let _ = serve_connection(
+                    stream,
+                    &service,
+                    &backend,
+                    #[cfg(target_os = "linux")]
+                    runtime_presence_publisher.as_deref(),
+                    max_frame_bytes,
+                    timeout,
+                );
             })
             .map_err(CodexDaemonError::Thread)?;
     }
@@ -379,11 +398,13 @@ fn prepare_runtime_presence_publisher(
 
 #[cfg(target_os = "linux")]
 fn start_periodic_runtime_presence_publisher(
-    mut publisher: crate::idunn_health::RuntimePresencePublisher,
+    publisher: Arc<Mutex<crate::idunn_health::RuntimePresencePublisher>>,
     backend: Arc<CodexProviderBackend>,
 ) -> Result<(), CodexDaemonError> {
     let (state, detail) = provider_health_observation(&backend);
     publisher
+        .lock()
+        .map_err(|_| CodexDaemonError::RuntimePresencePoisoned)?
         .publish(state, detail)
         .map_err(CodexDaemonError::Health)?;
     thread::Builder::new()
@@ -392,7 +413,11 @@ fn start_periodic_runtime_presence_publisher(
             loop {
                 thread::sleep(Duration::from_secs(10));
                 let (state, detail) = provider_health_observation(&backend);
-                if let Err(error) = publisher.publish(state, detail) {
+                let publication = publisher
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("runtime presence publisher lock was poisoned"))
+                    .and_then(|mut publisher| publisher.publish(state, detail));
+                if let Err(error) = publication {
                     eprintln!("codex-connector health publication failed: {error}");
                 }
             }
@@ -568,6 +593,9 @@ fn serve_connection(
     mut stream: TcpStream,
     service: &Mutex<CodexTransportService>,
     backend: &CodexProviderBackend,
+    #[cfg(target_os = "linux")] runtime_presence_publisher: Option<
+        &Mutex<crate::idunn_health::RuntimePresencePublisher>,
+    >,
     max_frame_bytes: usize,
     timeout: Duration,
 ) -> Result<(), CodexDaemonError> {
@@ -576,8 +604,37 @@ fn serve_connection(
         .and_then(|()| stream.set_write_timeout(Some(timeout)))
         .map_err(CodexDaemonError::Connection)?;
     let request = read_transport_frame(&mut stream, max_frame_bytes).map_err(frame_error)?;
+    #[cfg(target_os = "linux")]
+    let response = dispatch_native_frame(
+        &request,
+        runtime_presence_publisher.is_some(),
+        |message_id| {
+            let publisher =
+                runtime_presence_publisher.ok_or(CodexDaemonError::RouteObservationRefused)?;
+            let mut publisher = publisher
+                .lock()
+                .map_err(|_| CodexDaemonError::RuntimePresencePoisoned)?;
+            let backend_ready = backend.readiness().is_ok();
+            let response = publisher
+                .route_observation(message_id, backend_ready)
+                .map_err(CodexDaemonError::Health)?;
+            encode_cultnet_message_to_vec(&response, CultNetWireContract::CultNetSchemaV0)
+                .map_err(|_| CodexDaemonError::FrameEncoding)
+        },
+        |request| execute_inference_frame(request, service, backend),
+    )?;
+    #[cfg(not(target_os = "linux"))]
+    let response = execute_inference_frame(&request, service, backend)?;
+    write_transport_frame(&mut stream, &response, max_frame_bytes).map_err(frame_error)
+}
+
+fn execute_inference_frame(
+    request: &[u8],
+    service: &Mutex<CodexTransportService>,
+    backend: &CodexProviderBackend,
+) -> Result<Vec<u8>, CodexDaemonError> {
     let envelope: CodexTransportEnvelope =
-        rmp_serde::from_slice(&request).map_err(|_| CodexDaemonError::FrameEncoding)?;
+        rmp_serde::from_slice(request).map_err(|_| CodexDaemonError::FrameEncoding)?;
     let admission = service
         .lock()
         .map_err(|_| CodexDaemonError::ServicePoisoned)?
@@ -592,8 +649,45 @@ fn serve_connection(
                 .complete(*claim, result)?
         }
     };
-    let response = rmp_serde::to_vec(&response).map_err(|_| CodexDaemonError::FrameEncoding)?;
-    write_transport_frame(&mut stream, &response, max_frame_bytes).map_err(frame_error)
+    rmp_serde::to_vec(&response).map_err(|_| CodexDaemonError::FrameEncoding)
+}
+
+#[cfg(target_os = "linux")]
+fn dispatch_native_frame<RouteObservation, Inference>(
+    request: &[u8],
+    managed: bool,
+    route_observation: RouteObservation,
+    inference: Inference,
+) -> Result<Vec<u8>, CodexDaemonError>
+where
+    RouteObservation: FnOnce(&str) -> Result<Vec<u8>, CodexDaemonError>,
+    Inference: FnOnce(&[u8]) -> Result<Vec<u8>, CodexDaemonError>,
+{
+    let Ok(message) =
+        decode_cultnet_message_from_slice(request, CultNetWireContract::CultNetSchemaV0)
+    else {
+        return inference(request);
+    };
+    let CultNetMessage::SnapshotRequest {
+        message_id,
+        schema_ids,
+        record_keys,
+    } = message
+    else {
+        return inference(request);
+    };
+    let exact_schema = matches!(
+        schema_ids.as_deref(),
+        Some([schema_id]) if schema_id == GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA
+    );
+    let exact_record = matches!(
+        record_keys.as_deref(),
+        Some([record_key]) if record_key == crate::idunn_health::CONNECTOR_TARGET
+    );
+    if !managed || !exact_schema || !exact_record {
+        return Err(CodexDaemonError::RouteObservationRefused);
+    }
+    route_observation(&message_id)
 }
 
 fn frame_error(error: TransportFrameError) -> CodexDaemonError {
@@ -669,6 +763,12 @@ pub enum CodexDaemonError {
     #[cfg(target_os = "linux")]
     #[error("connector health thread could not start")]
     HealthThread(#[source] std::io::Error),
+    #[cfg(target_os = "linux")]
+    #[error("connector runtime presence publisher lock was poisoned")]
+    RuntimePresencePoisoned,
+    #[cfg(target_os = "linux")]
+    #[error("connector route observation request was refused")]
+    RouteObservationRefused,
     #[error("connector connection failed")]
     Connection(#[source] std::io::Error),
     #[error("connector frame exceeded its bound")]
@@ -682,6 +782,8 @@ pub enum CodexDaemonError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use std::cell::Cell;
     use std::io::Cursor;
 
     fn config(root: &Path) -> CodexDaemonConfig {
@@ -719,6 +821,105 @@ mod tests {
             provider_health_state(false),
             ("degraded", "provider-backend-unready")
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn exact_managed_route_probe_bypasses_inference_execution() {
+        let request = encode_cultnet_message_to_vec(
+            &CultNetMessage::SnapshotRequest {
+                message_id: "route-challenge-17".into(),
+                schema_ids: Some(vec![GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA.into()]),
+                record_keys: Some(vec![crate::idunn_health::CONNECTOR_TARGET.into()]),
+            },
+            CultNetWireContract::CultNetSchemaV0,
+        )
+        .unwrap();
+        let inference_calls = Cell::new(0);
+        let route_calls = Cell::new(0);
+
+        let response = dispatch_native_frame(
+            &request,
+            true,
+            |message_id| {
+                route_calls.set(route_calls.get() + 1);
+                assert_eq!(message_id, "route-challenge-17");
+                Ok(b"signed-route-observation".to_vec())
+            },
+            |_| {
+                inference_calls.set(inference_calls.get() + 1);
+                Ok(b"provider-response".to_vec())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response, b"signed-route-observation");
+        assert_eq!(route_calls.get(), 1);
+        assert_eq!(inference_calls.get(), 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn route_probe_refuses_broad_foreign_and_unmanaged_requests() {
+        let requests = [
+            (
+                CultNetMessage::SnapshotRequest {
+                    message_id: "broad".into(),
+                    schema_ids: None,
+                    record_keys: None,
+                },
+                true,
+            ),
+            (
+                CultNetMessage::SnapshotRequest {
+                    message_id: "foreign-schema".into(),
+                    schema_ids: Some(vec!["gamecult.other.v1".into()]),
+                    record_keys: Some(vec![crate::idunn_health::CONNECTOR_TARGET.into()]),
+                },
+                true,
+            ),
+            (
+                CultNetMessage::SnapshotRequest {
+                    message_id: "foreign-record".into(),
+                    schema_ids: Some(vec![GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA.into()]),
+                    record_keys: Some(vec!["other-target".into()]),
+                },
+                true,
+            ),
+            (
+                CultNetMessage::SnapshotRequest {
+                    message_id: "unmanaged".into(),
+                    schema_ids: Some(vec![GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA.into()]),
+                    record_keys: Some(vec![crate::idunn_health::CONNECTOR_TARGET.into()]),
+                },
+                false,
+            ),
+        ];
+
+        for (request, managed) in requests {
+            let request =
+                encode_cultnet_message_to_vec(&request, CultNetWireContract::CultNetSchemaV0)
+                    .unwrap();
+            let route_calls = Cell::new(0);
+            let inference_calls = Cell::new(0);
+            assert!(matches!(
+                dispatch_native_frame(
+                    &request,
+                    managed,
+                    |_| {
+                        route_calls.set(route_calls.get() + 1);
+                        Ok(Vec::new())
+                    },
+                    |_| {
+                        inference_calls.set(inference_calls.get() + 1);
+                        Ok(Vec::new())
+                    },
+                ),
+                Err(CodexDaemonError::RouteObservationRefused)
+            ));
+            assert_eq!(route_calls.get(), 0);
+            assert_eq!(inference_calls.get(), 0);
+        }
     }
 
     #[test]

@@ -32,7 +32,7 @@ const SYSTEMD_LISTEN_FDS_START: RawFd = 3;
 const ACTIVATION_SIGNER_FD_NAME: &str = IDUNN_RUNTIME_ACTIVATION_CREDENTIAL_NAME;
 const PROVIDER_SIGNER_FD_NAME: &str = "gamecult-runtime-presence-identity";
 
-const CONNECTOR_TARGET: &str = "codex-connector";
+pub(crate) const CONNECTOR_TARGET: &str = "codex-connector";
 const CONNECTOR_CAPABILITY: &str = "gamecult.codex.subscription-inference";
 const CONNECTOR_COMPATIBILITY: &str = "v2";
 pub(crate) const CONNECTOR_HEALTH_CONTRACT: &str = "codex-connector.runtime-health.v1";
@@ -217,6 +217,48 @@ impl RuntimePresencePublisher {
         self.write_lease
             .clone()
             .context("Connector has not acquired its process-write lease")
+    }
+
+    pub(crate) fn route_observation(
+        &mut self,
+        message_id: &str,
+        backend_ready: bool,
+    ) -> Result<CultNetMessage> {
+        ensure!(
+            !message_id.is_empty(),
+            "route-observation message id is empty"
+        );
+        let guard = self
+            .write_lease
+            .as_ref()
+            .context("Connector route observation lacks its process-write lease")?;
+        guard.require_current()?;
+        self.signed_route_observation(message_id, backend_ready)
+    }
+
+    fn signed_route_observation(
+        &mut self,
+        message_id: &str,
+        backend_ready: bool,
+    ) -> Result<CultNetMessage> {
+        let state = if backend_ready { "active" } else { "degraded" };
+        let detail = format!("route-observation:{message_id}");
+        let record = self.signed_record(state, &detail, unix_millis()?)?;
+        let payload = rmp_serde::to_vec(&record)?;
+        ensure!(
+            rmp_serde::from_slice::<GameCultRuntimePresenceHealthRecord>(&payload)? == record,
+            "route observation did not round-trip canonically"
+        );
+        Ok(CultNetMessage::SnapshotResponseRaw {
+            message_id: message_id.into(),
+            documents: vec![presence_document(
+                &self.authority.expected.target,
+                &self.authority.expected.runtime_id,
+                &record,
+                payload,
+                None,
+            )?],
+        })
     }
 
     pub(crate) fn publish(&mut self, state: &str, detail: &str) -> Result<String> {
@@ -627,21 +669,13 @@ fn publish_presence(
             "codex-connector-presence:{}:{}:{}",
             target, record.runtime_instance_id, record.publisher_sequence
         ),
-        document: CultNetRawDocumentRecord {
-            schema_id: GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA.into(),
-            record_key: target.into(),
-            stored_at: chrono::DateTime::from_timestamp_millis(
-                record.observed_at_unix_millis.try_into()?,
-            )
-            .context("runtime presence observation time is invalid")?
-            .to_rfc3339(),
-            payload_encoding: CultNetRawPayloadEncoding::Messagepack,
+        document: presence_document(
+            target,
+            runtime_id,
+            record,
             payload,
-            source_runtime_id: Some(runtime_id.into()),
-            source_agent_id: Some(record.signer_identity_id.clone()),
-            source_role: Some("runtime-presence-health-publisher".into()),
-            tags: Some(vec![RUDP_PROTOCOL_ID.into()]),
-        },
+            Some(vec![RUDP_PROTOCOL_ID.into()]),
+        )?,
     };
     let socket = UdpSocket::bind(if endpoint.is_ipv4() {
         "0.0.0.0:0"
@@ -686,6 +720,30 @@ fn publish_presence(
         }
     }
     Ok(())
+}
+
+fn presence_document(
+    target: &str,
+    runtime_id: &str,
+    record: &GameCultRuntimePresenceHealthRecord,
+    payload: Vec<u8>,
+    tags: Option<Vec<String>>,
+) -> Result<CultNetRawDocumentRecord> {
+    Ok(CultNetRawDocumentRecord {
+        schema_id: GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA.into(),
+        record_key: target.into(),
+        stored_at: chrono::DateTime::from_timestamp_millis(
+            record.observed_at_unix_millis.try_into()?,
+        )
+        .context("runtime presence observation time is invalid")?
+        .to_rfc3339(),
+        payload_encoding: CultNetRawPayloadEncoding::Messagepack,
+        payload,
+        source_runtime_id: Some(runtime_id.into()),
+        source_agent_id: Some(record.signer_identity_id.clone()),
+        source_role: Some("runtime-presence-health-publisher".into()),
+        tags,
+    })
 }
 
 fn require_runtime_bundle(bundle: &Path) -> Result<()> {
@@ -1104,6 +1162,7 @@ mod tests {
         File::create(&lock_path)?;
         let lock = OpenOptions::new().read(true).open(lock_path)?;
         fs2::FileExt::lock_shared(&lock)?;
+        let lease_sha256 = sha('8');
         publisher.write_lease = Some(ProcessWriteLeaseGuard {
             held: Arc::new(HeldProcessWriteLease {
                 _lock: lock,
@@ -1113,7 +1172,7 @@ mod tests {
                 activation: activation.clone(),
                 activation_sha256: activation.canonical_sha256()?,
                 warming_presence_sha256: warming.canonical_sha256()?,
-                lease_sha256: sha('8'),
+                lease_sha256: lease_sha256.clone(),
             }),
         });
         let active = publisher.signed_record("active", "ready", issued_at)?;
@@ -1138,6 +1197,58 @@ mod tests {
             },
         )?;
         assert_eq!(claim.record(), &active);
+
+        let route_response = publisher.signed_route_observation("challenge-23", true)?;
+        let CultNetMessage::SnapshotResponseRaw {
+            message_id,
+            documents,
+        } = route_response
+        else {
+            panic!("route observation was not a raw snapshot response");
+        };
+        assert_eq!(message_id, "challenge-23");
+        let [document] = documents.as_slice() else {
+            panic!("route observation did not contain exactly one document");
+        };
+        assert_eq!(document.schema_id, GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA);
+        assert_eq!(document.record_key, CONNECTOR_TARGET);
+        assert_eq!(document.tags, None);
+        let route_presence: GameCultRuntimePresenceHealthRecord =
+            rmp_serde::from_slice(&document.payload)?;
+        assert_eq!(route_presence.state, "active");
+        assert_eq!(route_presence.detail, "route-observation:challenge-23");
+        assert_eq!(
+            route_presence.write_lease_sha256.as_deref(),
+            Some(lease_sha256.as_str())
+        );
+        assert_eq!(route_presence.publisher_sequence, 3);
+        let claim = authenticate_runtime_presence_claim(
+            &document.payload,
+            &authority,
+            RuntimePresenceAuthenticationContext {
+                trusted_received_at_unix_millis: route_presence.observed_at_unix_millis,
+                maximum_age_millis: 1_000,
+                maximum_future_skew_millis: 1_000,
+            },
+        )?;
+        assert_eq!(claim.record(), &route_presence);
+
+        let degraded = publisher.signed_route_observation("challenge-24", false)?;
+        let CultNetMessage::SnapshotResponseRaw { documents, .. } = degraded else {
+            panic!("degraded route observation was not a raw snapshot response");
+        };
+        let degraded: GameCultRuntimePresenceHealthRecord =
+            rmp_serde::from_slice(&documents[0].payload)?;
+        assert_eq!(degraded.state, "degraded");
+        assert_eq!(degraded.detail, "route-observation:challenge-24");
+
+        // A held historical guard is not enough: every route challenge must
+        // re-read the exact Idunn lease before signing its data-plane proof.
+        assert!(
+            publisher
+                .route_observation("challenge-stale", true)
+                .is_err()
+        );
         let contender = OpenOptions::new()
             .read(true)
             .write(true)
