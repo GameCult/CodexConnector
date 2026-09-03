@@ -31,6 +31,8 @@ const SYSTEMD_LISTEN_FDNAMES_ENVIRONMENT: &str = "LISTEN_FDNAMES";
 const SYSTEMD_LISTEN_FDS_START: RawFd = 3;
 const ACTIVATION_SIGNER_FD_NAME: &str = IDUNN_RUNTIME_ACTIVATION_CREDENTIAL_NAME;
 const PROVIDER_SIGNER_FD_NAME: &str = "gamecult-runtime-presence-identity";
+const WARMING_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_RECENT_WARMING_PROOFS: usize = 64;
 
 pub(crate) const CONNECTOR_TARGET: &str = "codex-connector";
 const CONNECTOR_CAPABILITY: &str = "gamecult.codex.subscription-inference";
@@ -98,7 +100,7 @@ struct HeldProcessWriteLease {
     expected_sha256: String,
     activation: IdunnRuntimeActivationRecord,
     activation_sha256: String,
-    warming_presence_sha256: String,
+    warming_presence_sha256es: Vec<String>,
     lease_sha256: String,
 }
 
@@ -114,7 +116,7 @@ impl ProcessWriteLeaseGuard {
             &self.held.expected_sha256,
             &self.held.activation,
             &self.held.activation_sha256,
-            &self.held.warming_presence_sha256,
+            &self.held.warming_presence_sha256es,
         )?;
         ensure!(
             observed.as_deref() == Some(self.sha256()),
@@ -182,16 +184,22 @@ impl RuntimePresencePublisher {
         warming_presence_sha256: &str,
         timeout: Duration,
     ) -> Result<()> {
-        let path = &self.write_lease_path;
+        let path = self.write_lease_path.clone();
         let started = Instant::now();
+        let mut next_heartbeat = Instant::now() + WARMING_HEARTBEAT_INTERVAL;
+        let mut recent_warming_proofs = Vec::new();
+        remember_warming_proof(
+            &mut recent_warming_proofs,
+            warming_presence_sha256.to_owned(),
+        );
         loop {
             let last_error = match acquire_process_write_lease_guard(
-                path,
+                &path,
                 &self.authority.expected,
                 &self.authority.expected_sha256,
                 &self.authority.activation,
                 &self.authority.activation_sha256,
-                warming_presence_sha256,
+                &recent_warming_proofs,
             ) {
                 Ok(Some(guard)) => {
                     self.write_lease = Some(guard);
@@ -208,6 +216,14 @@ impl RuntimePresencePublisher {
                     "timed out waiting for Idunn process-write lease {}: {detail}",
                     path.display()
                 );
+            }
+            let now = Instant::now();
+            if now >= next_heartbeat {
+                let heartbeat = self
+                    .publish("warming", "awaiting-process-write-lease")
+                    .context("publishing Warming heartbeat while awaiting process lease")?;
+                remember_warming_proof(&mut recent_warming_proofs, heartbeat);
+                next_heartbeat = now + WARMING_HEARTBEAT_INTERVAL;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -534,7 +550,7 @@ fn load_process_write_lease(
     expected_sha256: &str,
     activation: &IdunnRuntimeActivationRecord,
     activation_sha256: &str,
-    warming_presence_sha256: &str,
+    warming_presence_sha256es: &[String],
 ) -> Result<Option<String>> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => {}
@@ -566,7 +582,7 @@ fn load_process_write_lease(
             expected_sha256,
             activation,
             activation_sha256,
-            warming_presence_sha256,
+            warming_presence_sha256es,
         )
         .map(Some)
     })
@@ -578,7 +594,7 @@ fn acquire_process_write_lease_guard(
     expected_sha256: &str,
     activation: &IdunnRuntimeActivationRecord,
     activation_sha256: &str,
-    warming_presence_sha256: &str,
+    warming_presence_sha256es: &[String],
 ) -> Result<Option<ProcessWriteLeaseGuard>> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => {}
@@ -604,7 +620,7 @@ fn acquire_process_write_lease_guard(
         expected_sha256,
         activation,
         activation_sha256,
-        warming_presence_sha256,
+        warming_presence_sha256es,
     )?;
     let Some(lease_sha256) = lease_sha256 else {
         return Ok(None);
@@ -617,7 +633,7 @@ fn acquire_process_write_lease_guard(
             expected_sha256: expected_sha256.into(),
             activation: activation.clone(),
             activation_sha256: activation_sha256.into(),
-            warming_presence_sha256: warming_presence_sha256.into(),
+            warming_presence_sha256es: warming_presence_sha256es.to_vec(),
             lease_sha256,
         }),
     }))
@@ -629,7 +645,7 @@ fn exact_process_write_lease_sha256(
     expected_sha256: &str,
     activation: &IdunnRuntimeActivationRecord,
     activation_sha256: &str,
-    warming_presence_sha256: &str,
+    warming_presence_sha256es: &[String],
 ) -> Result<String> {
     lease.validate()?;
     ensure!(
@@ -651,10 +667,19 @@ fn exact_process_write_lease_sha256(
                     .context("Expected has no state contract")?
             && lease.runtime_id == expected.runtime_id
             && lease.runtime_instance_id == activation.runtime_instance_id
-            && lease.warming_presence_sha256 == warming_presence_sha256,
-        "process-write lease does not bind this exact warming incarnation"
+            && warming_presence_sha256es
+                .iter()
+                .any(|sha256| sha256 == &lease.warming_presence_sha256),
+        "process-write lease does not bind a provider-owned Warming proof for this incarnation"
     );
     lease.canonical_sha256()
+}
+
+fn remember_warming_proof(proofs: &mut Vec<String>, sha256: String) {
+    proofs.push(sha256);
+    while proofs.len() > MAX_RECENT_WARMING_PROOFS {
+        proofs.remove(0);
+    }
 }
 
 fn publish_presence(
@@ -1158,6 +1183,9 @@ mod tests {
         let warming = publisher.signed_record("warming", "waiting", issued_at)?;
         assert_eq!(warming.publisher_sequence, 1);
         assert_eq!(warming.write_lease_sha256, None);
+        let heartbeat = publisher.signed_record("warming", "waiting", issued_at + 1)?;
+        assert_eq!(heartbeat.publisher_sequence, 2);
+        assert_ne!(heartbeat.canonical_sha256()?, warming.canonical_sha256()?);
         let lock_path = root.join("lease.cc.lock");
         File::create(&lock_path)?;
         let lock = OpenOptions::new().read(true).open(lock_path)?;
@@ -1171,12 +1199,15 @@ mod tests {
                 expected_sha256: expected.canonical_sha256()?,
                 activation: activation.clone(),
                 activation_sha256: activation.canonical_sha256()?,
-                warming_presence_sha256: warming.canonical_sha256()?,
+                warming_presence_sha256es: vec![
+                    warming.canonical_sha256()?,
+                    heartbeat.canonical_sha256()?,
+                ],
                 lease_sha256: lease_sha256.clone(),
             }),
         });
         let active = publisher.signed_record("active", "ready", issued_at)?;
-        assert_eq!(active.publisher_sequence, 2);
+        assert_eq!(active.publisher_sequence, 3);
         assert_eq!(active.signature.len(), 64);
         assert_eq!(active.activation_signature.len(), 64);
 
@@ -1221,7 +1252,7 @@ mod tests {
             route_presence.write_lease_sha256.as_deref(),
             Some(lease_sha256.as_str())
         );
-        assert_eq!(route_presence.publisher_sequence, 3);
+        assert_eq!(route_presence.publisher_sequence, 4);
         let claim = authenticate_runtime_presence_claim(
             &document.payload,
             &authority,
@@ -1323,6 +1354,8 @@ mod tests {
             lease_epoch: 1,
             issued_at_unix_millis: 1,
         };
+        let heartbeat_sha256 = sha('9');
+        let provider_owned_warming = vec![warming_sha256.clone(), heartbeat_sha256.clone()];
         assert_eq!(
             exact_process_write_lease_sha256(
                 &lease,
@@ -1330,11 +1363,11 @@ mod tests {
                 &expected_sha256,
                 &activation,
                 &activation_sha256,
-                &warming_sha256,
+                &provider_owned_warming,
             )?,
             lease.canonical_sha256()?
         );
-        lease.warming_presence_sha256 = sha('9');
+        lease.warming_presence_sha256 = heartbeat_sha256;
         assert!(
             exact_process_write_lease_sha256(
                 &lease,
@@ -1342,7 +1375,19 @@ mod tests {
                 &expected_sha256,
                 &activation,
                 &activation_sha256,
-                &warming_sha256,
+                &provider_owned_warming,
+            )
+            .is_ok()
+        );
+        lease.warming_presence_sha256 = sha('a');
+        assert!(
+            exact_process_write_lease_sha256(
+                &lease,
+                &expected,
+                &expected_sha256,
+                &activation,
+                &activation_sha256,
+                &provider_owned_warming,
             )
             .is_err()
         );
