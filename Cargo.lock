@@ -203,6 +203,7 @@ dependencies = [
 [[package]]
 name = "cultcache-rs"
 version = "0.1.0"
+source = "git+https://github.com/GameCult/CultLib.git?rev=e171eca32329baa928f4a1d810401a8b4c857029#e171eca32329baa928f4a1d810401a8b4c857029"
 dependencies = [
  "anyhow",
  "chrono",
@@ -220,6 +221,7 @@ dependencies = [
 [[package]]
 name = "cultcache-rs-derive"
 version = "0.1.0"
+source = "git+https://github.com/GameCult/CultLib.git?rev=e171eca32329baa928f4a1d810401a8b4c857029#e171eca32329baa928f4a1d810401a8b4c857029"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -229,6 +231,7 @@ dependencies = [
 [[package]]
 name = "cultnet-rs"
 version = "0.1.0"
+source = "git+https://github.com/GameCult/CultLib.git?rev=e171eca32329baa928f4a1d810401a8b4c857029#e171eca32329baa928f4a1d810401a8b4c857029"
 dependencies = [
  "aes-gcm",
  "anyhow",
