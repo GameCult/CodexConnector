@@ -1,7 +1,6 @@
 schema = "gamecult.idunn.target_declaration.v1"
 target = "codex-connector"
 source_stamp_environment = "CODEX_CONNECTOR_BUILD_COMMIT"
-required_gitlinks = ["vendor/cultcache-rs", "vendor/cultnet-rs"]
 
 [[steps]]
 id = "extract-codex"
@@ -85,7 +84,6 @@ required_environment = [
   "GAMECULT_IDUNN_PROCESS_WRITE_LEASE",
   "GAMECULT_IDUNN_RUNTIME_BUNDLE",
 ]
-optional_environment = ["RUST_LOG"]
 
 [service.health]
 contract = "codex-connector.runtime-health.v1"
