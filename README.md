@@ -5,6 +5,14 @@ subscription inference. Epiphany and Ghostlight remain separate minds. They
 derive their own exact provider requests, execute their own tools, interpret
 their own results, and admit their own state.
 
+**Valuable here:** the consumer ABI in `src/lib.rs`. It holds the v2 typed contracts (`CodexProviderRequest`, `CodexTransportInvocation`, `CodexTransportReceipt`), exact Responses lowering (`canonical_responses_body`), AES-256-GCM envelopes (`encrypt_invocation`, `decrypt_result`) and the one-request client (`CodexConnectorClient`). The daemon behind it (`src/daemon.rs`, `src/provider_backend.rs`) is the only process that ever holds the Codex credential.
+
+**Problem it solves:** several minds (Epiphany, Ghostlight) need Codex-compatible subscription inference, but must not each hold or refresh the credential, copy wire law, or hand cognition to a transport service. The connector isolates the credential and transports exact provider requests with receipts, and decides nothing about prompts or tools.
+
+**Entry points:** library `src/lib.rs` (no daemon code, safe to depend on); daemon feature `--features daemon`, binary `codex-connector` (`src/main.rs`); Idunn declaration `deployment/idunn/recipe.toml`, deployed with `idunn up codex-connector`; verification commands are listed below.
+
+**Status:** live as the library plus the daemon and its Idunn recipe, last changed 2026-09-13. This repo records no planned work; changes to the contract below are the open surface.
+
 The service owns authenticated caller admission, bounded transport physiology,
 exact provider-request receipts, and redacted CultMesh health. A private pinned
 official `codex app-server` child is the sole writer and refresh authority for
